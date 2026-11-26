@@ -109,7 +109,11 @@ HyprPilot gives you two ways to connect to AI models:
 | `Ctrl + 1` / `Ctrl + 2` | Switch between Native Chat & Web Portals |
 | `Ctrl + N` | Start a new Native Chat |
 | `Ctrl + ,` | Open Settings |
-| `Enter` / `Shift + Enter` | Send prompt / Insert newline |
+| `Enter` / `Shift + Enter` | *(GUI)* Send prompt / Insert newline |
+| `Ctrl + P` / `Ctrl + M` / `Ctrl + R` | *(TUI)* Switch Provider / Switch Model / Fetch Models |
+| `Ctrl + G` or `F4` | *(TUI)* Browse & load SQLite chat history |
+| `Ctrl + Backspace` / `Ctrl + W` | *(TUI)* Delete previous word |
+| `Ctrl + Y` / `Ctrl + L` | *(TUI)* Copy last reply / Toggle Linux Quick mode |
 
 ---
 

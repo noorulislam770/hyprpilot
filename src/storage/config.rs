@@ -226,6 +226,12 @@ pub fn socket_path() -> PathBuf {
         .join("hyprpilot.sock")
 }
 
+pub fn tui_socket_path() -> PathBuf {
+    dirs::runtime_dir()
+        .unwrap_or_else(state_dir)
+        .join("hyprpilot-tui.sock")
+}
+
 pub fn config_path() -> PathBuf {
     config_dir().join("config.toml")
 }
