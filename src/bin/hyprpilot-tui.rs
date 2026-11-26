@@ -50,8 +50,12 @@ struct WireMessage {
 struct SessionSnapshot {
     provider_id: String,
     provider_name: String,
+    provider_kind: String,
+    provider_auth: String,
+    provider_base_url: String,
     model: String,
     linux_quick_mode: bool,
+    preview_side: String,
     active_conversation_id: Option<i64>,
     messages: Vec<WireMessage>,
     streaming: bool,
@@ -79,6 +83,7 @@ enum ClientCmd {
     SelectModel { model: String },
     FetchModels,
     ToggleLinuxQuick,
+    SetPreviewSide { side: String },
     LoadConversation { id: i64 },
     QuitDaemon,
 }
@@ -104,23 +109,37 @@ struct DaemonState {
 
 impl DaemonState {
     fn snapshot(&self) -> SessionSnapshot {
-        let (provider_id, provider_name, model, models) = match self.config.active_provider() {
-            Some(p) => {
-                let mut list = p.available_models.clone();
-                if list.is_empty() && !p.model.trim().is_empty() {
-                    list.push(p.model.trim().to_string());
-                } else if !p.model.trim().is_empty() && !list.iter().any(|m| m == p.model.trim()) {
-                    list.insert(0, p.model.trim().to_string());
+        let (provider_id, provider_name, provider_kind, provider_auth, provider_base_url, model, models) =
+            match self.config.active_provider() {
+                Some(p) => {
+                    let mut list = p.available_models.clone();
+                    if list.is_empty() && !p.model.trim().is_empty() {
+                        list.push(p.model.trim().to_string());
+                    } else if !p.model.trim().is_empty() && !list.iter().any(|m| m == p.model.trim()) {
+                        list.insert(0, p.model.trim().to_string());
+                    }
+                    let kind = format!("{:?}", p.kind);
+                    let auth = format!("{:?}", p.auth_mode);
+                    (
+                        p.id.clone(),
+                        p.name.clone(),
+                        kind,
+                        auth,
+                        p.base_url.clone(),
+                        p.model.clone(),
+                        list,
+                    )
                 }
-                (p.id.clone(), p.name.clone(), p.model.clone(), list)
-            }
-            None => (
-                String::new(),
-                "None".to_string(),
-                "-".to_string(),
-                Vec::new(),
-            ),
-        };
+                None => (
+                    String::new(),
+                    "None".to_string(),
+                    "-".to_string(),
+                    "-".to_string(),
+                    "-".to_string(),
+                    "-".to_string(),
+                    Vec::new(),
+                ),
+            };
         let providers = self
             .config
             .providers
@@ -143,8 +162,12 @@ impl DaemonState {
         SessionSnapshot {
             provider_id,
             provider_name,
+            provider_kind,
+            provider_auth,
+            provider_base_url,
             model,
             linux_quick_mode: self.config.linux_quick_mode,
+            preview_side: self.config.tui_preview_side.clone(),
             active_conversation_id: self.active_conversation_id,
             messages: self
                 .messages
@@ -367,6 +390,18 @@ fn handle_daemon_cmd(
                     "OFF"
                 }
             );
+            guard.broadcast_snapshot();
+        }
+        ClientCmd::SetPreviewSide { side } => {
+            let mut guard = state.lock().unwrap();
+            let normalized = if side.eq_ignore_ascii_case("left") {
+                "left".to_string()
+            } else {
+                "right".to_string()
+            };
+            guard.config.tui_preview_side = normalized.clone();
+            let _ = guard.config.save();
+            guard.status = format!("Preview side: {normalized}");
             guard.broadcast_snapshot();
         }
         ClientCmd::SelectProvider { id } => {
@@ -694,11 +729,142 @@ fn extract_copy_sections(markdown: &str) -> Vec<CopySection> {
     sections
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VimMode {
+    Insert,
+    Normal,
+    Search,
+    Command,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FocusPane {
+    Chat,
+    History,
+    Inspector,
+}
+
+#[derive(Clone)]
+struct TuiArtifact {
+    title: String,
+    kind: String, // "markdown", "html", "svg", "code"
+    content: String,
+}
+
+fn extract_artifacts(messages: &[WireMessage]) -> Vec<TuiArtifact> {
+    let Some(last) = messages.iter().rev().find(|m| m.role == "assistant") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut in_code = false;
+    let mut lang = String::new();
+    let mut buf = String::new();
+
+    for line in last.content.lines() {
+        let t = line.trim_start();
+        if t.starts_with("```") {
+            if in_code {
+                in_code = false;
+                let norm = lang.trim().to_ascii_lowercase();
+                let body = buf.trim_end_matches('\n').to_string();
+                let is_rich = matches!(norm.as_str(), "md" | "markdown" | "html" | "htm" | "svg");
+                if !body.trim().is_empty() && (is_rich || body.lines().count() >= 4) {
+                    let kind = match norm.as_str() {
+                        "md" | "markdown" => "markdown",
+                        "html" | "htm" => "html",
+                        "svg" => "svg",
+                        _ => "code",
+                    }
+                    .to_string();
+                    let label_lang = if norm.is_empty() { "snippet" } else { &norm };
+                    out.push(TuiArtifact {
+                        title: format!("Artifact #{} ({label_lang})", out.len() + 1),
+                        kind,
+                        content: body,
+                    });
+                }
+                lang.clear();
+                buf.clear();
+            } else {
+                in_code = true;
+                lang = t.trim_start_matches('`').trim().to_string();
+            }
+            continue;
+        }
+        if in_code {
+            buf.push_str(line);
+            buf.push('\n');
+        }
+    }
+
+    // Fallback: if no fenced artifact, offer full assistant markdown reply as an on-demand artifact
+    if out.is_empty() && !last.content.trim().is_empty() {
+        out.push(TuiArtifact {
+            title: "Reply Markdown".to_string(),
+            kind: "markdown".to_string(),
+            content: last.content.clone(),
+        });
+    }
+    out
+}
+
+fn has_rich_md_artifact(messages: &[WireMessage]) -> bool {
+    let Some(last) = messages.iter().rev().find(|m| m.role == "assistant") else {
+        return false;
+    };
+    let lc = last.content.to_ascii_lowercase();
+    lc.contains("```markdown")
+        || lc.contains("```md")
+        || lc.contains("```html")
+        || lc.contains("```svg")
+}
+
+fn infer_model_specs(model: &str, provider_kind: &str) -> (&'static str, &'static str, &'static str) {
+    let m = model.to_ascii_lowercase();
+    let ctx = if m.contains("gemini") {
+        "1M tokens"
+    } else if m.contains("claude") {
+        "200K tokens"
+    } else if m.contains("gpt-4") || m.contains("o1") || m.contains("o3") || m.contains("o4") {
+        "128K tokens"
+    } else if m.contains("deepseek") || m.contains("llama") || m.contains("qwen") {
+        "128K tokens"
+    } else {
+        "Standard"
+    };
+
+    let tier = if m.contains("free") {
+        "Free Tier"
+    } else if m.contains("flash-lite")
+        || m.contains("mini")
+        || m.contains("nano")
+        || m.contains("haiku")
+        || m.contains("8b")
+        || m.contains("instant")
+        || m.contains("flash")
+    {
+        "Fast / Low-Token"
+    } else if m.contains("opus") || m.contains("pro") || m.contains("sonnet") || m.contains("r1") {
+        "Reasoning / Pro"
+    } else {
+        "Balanced"
+    };
+
+    let api = match provider_kind {
+        "Anthropic" => "Anthropic Messages",
+        "Gemini" => "Gemini GenerateContent",
+        _ => "OpenAI Chat Completions",
+    };
+
+    (ctx, tier, api)
+}
+
 enum Modal {
     None,
     Provider(ListState),
     Model(ListState),
     History(ListState),
+    Help,
     MarkdownPicker {
         files: Vec<String>,
         list_state: ListState,
@@ -742,6 +908,21 @@ struct TuiClient {
     should_quit: bool,
     tick: usize,
     local_notice: Option<String>,
+    vim_mode: VimMode,
+    focus: FocusPane,
+    pending_g: bool,
+    pending_w: bool,
+    search_query: String,
+    search_matches: Vec<usize>,
+    search_match_idx: usize,
+    command_buf: String,
+    preview_open: bool,
+    preview_artifacts: Vec<TuiArtifact>,
+    preview_idx: usize,
+    preview_scroll: u16,
+    was_streaming: bool,
+    history_state: ListState,
+    inspector_model_state: ListState,
 }
 
 impl TuiClient {
@@ -750,8 +931,12 @@ impl TuiClient {
         let empty = SessionSnapshot {
             provider_id: String::new(),
             provider_name: "Connecting...".into(),
+            provider_kind: "-".into(),
+            provider_auth: "-".into(),
+            provider_base_url: "-".into(),
             model: "-".into(),
             linux_quick_mode: true,
+            preview_side: "right".into(),
             active_conversation_id: None,
             messages: Vec::new(),
             streaming: false,
@@ -772,6 +957,21 @@ impl TuiClient {
             should_quit: false,
             tick: 0,
             local_notice: None,
+            vim_mode: VimMode::Insert,
+            focus: FocusPane::Chat,
+            pending_g: false,
+            pending_w: false,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            search_match_idx: 0,
+            command_buf: String::new(),
+            preview_open: false,
+            preview_artifacts: Vec::new(),
+            preview_idx: 0,
+            preview_scroll: 0,
+            was_streaming: false,
+            history_state: ListState::default(),
+            inspector_model_state: ListState::default(),
         };
         client.send_cmd(&ClientCmd::GetState);
         Ok(client)
@@ -789,13 +989,42 @@ impl TuiClient {
         while let Ok(ev) = self.rx.try_recv() {
             match ev {
                 ServerEvent::Snapshot(s) => {
+                    let finished_stream = self.was_streaming && !s.streaming;
+                    self.was_streaming = s.streaming;
                     self.snap = s;
                     self.local_notice = None;
                     if self.snap.streaming {
                         self.auto_scroll = true;
                     }
+                    // Sync sidebar selection indices
+                    if let Some(active_id) = self.snap.active_conversation_id {
+                        if let Some(pos) = self.snap.history.iter().position(|c| c.id == active_id)
+                        {
+                            self.history_state.select(Some(pos));
+                        }
+                    } else if !self.snap.history.is_empty() && self.history_state.selected().is_none()
+                    {
+                        self.history_state.select(Some(0));
+                    }
+                    if let Some(pos) = self.snap.models.iter().position(|m| m == &self.snap.model) {
+                        self.inspector_model_state.select(Some(pos));
+                    } else if !self.snap.models.is_empty()
+                        && self.inspector_model_state.selected().is_none()
+                    {
+                        self.inspector_model_state.select(Some(0));
+                    }
+                    // Refresh artifacts; auto-open when stream finishes with an explicit MD/HTML/SVG artifact
+                    self.preview_artifacts = extract_artifacts(&self.snap.messages);
+                    if self.preview_idx >= self.preview_artifacts.len() {
+                        self.preview_idx = 0;
+                    }
+                    if finished_stream && has_rich_md_artifact(&self.snap.messages) {
+                        self.preview_open = true;
+                        self.preview_scroll = 0;
+                    }
                 }
                 ServerEvent::Delta { text } => {
+                    self.was_streaming = true;
                     self.snap.streaming_reply.push_str(&text);
                     self.snap.streaming = true;
                     self.auto_scroll = true;
@@ -868,21 +1097,61 @@ impl TuiClient {
             return;
         }
 
-        // Ctrl+Backspace (often sent as Ctrl+H by terminals!) & Ctrl+W delete previous word
+        // Ctrl shortcuts work across Insert & Normal modes
         if mods.contains(KeyModifiers::CONTROL) {
             match code {
-                KeyCode::Backspace | KeyCode::Char('h') | KeyCode::Char('w') => {
+                KeyCode::Backspace | KeyCode::Char('h') if self.vim_mode == VimMode::Insert => {
                     self.delete_prev_word();
                 }
-                KeyCode::Char('u') => self.input.clear(),
+                KeyCode::Char('h') if self.vim_mode == VimMode::Normal => {
+                    self.focus = FocusPane::History;
+                }
+                KeyCode::Char('l') if self.vim_mode == VimMode::Normal && self.pending_w => {
+                    self.pending_w = false;
+                    self.focus = FocusPane::Inspector;
+                }
+                KeyCode::Char('w') if self.vim_mode == VimMode::Insert => {
+                    self.delete_prev_word();
+                }
+                KeyCode::Char('w') if self.vim_mode == VimMode::Normal => {
+                    if self.pending_w {
+                        self.pending_w = false;
+                        self.focus = match self.focus {
+                            FocusPane::History => FocusPane::Chat,
+                            FocusPane::Chat => FocusPane::Inspector,
+                            FocusPane::Inspector => FocusPane::History,
+                        };
+                    } else {
+                        self.pending_w = true;
+                    }
+                }
+                KeyCode::Char('d') => {
+                    self.auto_scroll = false;
+                    if self.focus == FocusPane::Inspector && self.preview_open {
+                        self.preview_scroll = self.preview_scroll.saturating_add(12);
+                    } else {
+                        self.scroll_offset = self.scroll_offset.saturating_add(12);
+                    }
+                }
+                KeyCode::Char('u') if self.vim_mode == VimMode::Insert => self.input.clear(),
+                KeyCode::Char('u') => {
+                    self.auto_scroll = false;
+                    if self.focus == FocusPane::Inspector && self.preview_open {
+                        self.preview_scroll = self.preview_scroll.saturating_sub(12);
+                    } else {
+                        self.scroll_offset = self.scroll_offset.saturating_sub(12);
+                    }
+                }
                 KeyCode::Char('q') | KeyCode::Char('c') => self.should_quit = true,
                 KeyCode::Char('p') => self.open_provider_modal(),
                 KeyCode::Char('m') => self.open_model_modal(),
                 KeyCode::Char('g') => self.open_history_modal(),
                 KeyCode::Char('o') => self.open_markdown_picker(),
+                KeyCode::Char('e') => self.toggle_artifact_preview(),
                 KeyCode::Char('r') => self.send_cmd(&ClientCmd::FetchModels),
                 KeyCode::Char('n') => {
                     self.scroll_offset = 0;
+                    self.preview_open = false;
                     self.send_cmd(&ClientCmd::NewChat);
                 }
                 KeyCode::Char('y') => self.open_copy_modal(),
@@ -903,12 +1172,52 @@ impl TuiClient {
             return;
         }
 
+        match self.vim_mode {
+            VimMode::Search => self.handle_search_key(code),
+            VimMode::Command => self.handle_command_key(code),
+            VimMode::Normal => self.handle_normal_key(code),
+            VimMode::Insert => self.handle_insert_key(code),
+        }
+    }
+
+    fn toggle_artifact_preview(&mut self) {
+        if self.preview_open {
+            self.preview_open = false;
+            if self.focus == FocusPane::Inspector {
+                self.focus = FocusPane::Chat;
+            }
+            return;
+        }
+        self.preview_artifacts = extract_artifacts(&self.snap.messages);
+        if self.preview_artifacts.is_empty() {
+            self.local_notice = Some("No assistant reply or artifact to preview yet".into());
+            return;
+        }
+        self.preview_idx = 0;
+        self.preview_scroll = 0;
+        self.preview_open = true;
+    }
+
+    fn handle_insert_key(&mut self, code: KeyCode) {
         match code {
-            KeyCode::Esc => self.should_quit = true,
+            KeyCode::Esc => {
+                self.vim_mode = VimMode::Normal;
+                self.pending_g = false;
+                self.pending_w = false;
+            }
+            KeyCode::F(1) => self.modal = Modal::Help,
             KeyCode::F(2) => self.open_provider_modal(),
             KeyCode::F(3) => self.open_model_modal(),
             KeyCode::F(4) => self.open_history_modal(),
             KeyCode::F(5) => self.send_cmd(&ClientCmd::FetchModels),
+            KeyCode::Tab => {
+                self.vim_mode = VimMode::Normal;
+                self.focus = match self.focus {
+                    FocusPane::Chat => FocusPane::Inspector,
+                    FocusPane::Inspector => FocusPane::History,
+                    FocusPane::History => FocusPane::Chat,
+                };
+            }
             KeyCode::Enter => {
                 let prompt = self.input.trim().to_string();
                 if !prompt.is_empty() && !self.snap.streaming {
@@ -938,6 +1247,364 @@ impl TuiClient {
             }
             KeyCode::Char(c) => self.input.push(c),
             _ => {}
+        }
+    }
+
+    fn handle_normal_key(&mut self, code: KeyCode) {
+        if self.pending_w {
+            self.pending_w = false;
+            match code {
+                KeyCode::Char('h') | KeyCode::Left => {
+                    self.focus = FocusPane::History;
+                    return;
+                }
+                KeyCode::Char('l') | KeyCode::Right => {
+                    self.focus = FocusPane::Inspector;
+                    return;
+                }
+                KeyCode::Char('c') | KeyCode::Char('j') | KeyCode::Char('k') => {
+                    self.focus = FocusPane::Chat;
+                    return;
+                }
+                KeyCode::Char('w') => {
+                    self.focus = match self.focus {
+                        FocusPane::History => FocusPane::Chat,
+                        FocusPane::Chat => FocusPane::Inspector,
+                        FocusPane::Inspector => FocusPane::History,
+                    };
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        let was_g = self.pending_g;
+        self.pending_g = false;
+
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('i') | KeyCode::Char('a') | KeyCode::Char('o') => {
+                self.focus = FocusPane::Chat;
+                self.vim_mode = VimMode::Insert;
+            }
+            KeyCode::Char('/') => {
+                self.search_query.clear();
+                self.search_matches.clear();
+                self.search_match_idx = 0;
+                self.vim_mode = VimMode::Search;
+            }
+            KeyCode::Char(':') => {
+                self.command_buf.clear();
+                self.vim_mode = VimMode::Command;
+            }
+            KeyCode::Char('?') | KeyCode::F(1) => {
+                self.modal = Modal::Help;
+            }
+            KeyCode::Tab => {
+                self.focus = match self.focus {
+                    FocusPane::Chat => FocusPane::Inspector,
+                    FocusPane::Inspector => FocusPane::History,
+                    FocusPane::History => FocusPane::Chat,
+                };
+            }
+            KeyCode::Char('h') | KeyCode::Left => {
+                self.focus = match self.focus {
+                    FocusPane::Inspector => FocusPane::Chat,
+                    FocusPane::Chat => FocusPane::History,
+                    FocusPane::History => FocusPane::History,
+                };
+            }
+            KeyCode::Char('l') | KeyCode::Right => {
+                self.focus = match self.focus {
+                    FocusPane::History => FocusPane::Chat,
+                    FocusPane::Chat => FocusPane::Inspector,
+                    FocusPane::Inspector => FocusPane::Inspector,
+                };
+            }
+            KeyCode::Char('j') | KeyCode::Down => match self.focus {
+                FocusPane::Chat => {
+                    self.auto_scroll = false;
+                    self.scroll_offset = self.scroll_offset.saturating_add(2);
+                }
+                FocusPane::History => {
+                    if !self.snap.history.is_empty() {
+                        let next = self
+                            .history_state
+                            .selected()
+                            .map(|i| (i + 1).min(self.snap.history.len() - 1))
+                            .unwrap_or(0);
+                        self.history_state.select(Some(next));
+                    }
+                }
+                FocusPane::Inspector => {
+                    if self.preview_open {
+                        self.preview_scroll = self.preview_scroll.saturating_add(2);
+                    } else if !self.snap.models.is_empty() {
+                        let next = self
+                            .inspector_model_state
+                            .selected()
+                            .map(|i| (i + 1).min(self.snap.models.len() - 1))
+                            .unwrap_or(0);
+                        self.inspector_model_state.select(Some(next));
+                    }
+                }
+            },
+            KeyCode::Char('k') | KeyCode::Up => match self.focus {
+                FocusPane::Chat => {
+                    self.auto_scroll = false;
+                    self.scroll_offset = self.scroll_offset.saturating_sub(2);
+                }
+                FocusPane::History => {
+                    if !self.snap.history.is_empty() {
+                        let next = self
+                            .history_state
+                            .selected()
+                            .map(|i| i.saturating_sub(1))
+                            .unwrap_or(0);
+                        self.history_state.select(Some(next));
+                    }
+                }
+                FocusPane::Inspector => {
+                    if self.preview_open {
+                        self.preview_scroll = self.preview_scroll.saturating_sub(2);
+                    } else if !self.snap.models.is_empty() {
+                        let next = self
+                            .inspector_model_state
+                            .selected()
+                            .map(|i| i.saturating_sub(1))
+                            .unwrap_or(0);
+                        self.inspector_model_state.select(Some(next));
+                    }
+                }
+            },
+            KeyCode::Enter => match self.focus {
+                FocusPane::History => {
+                    if let Some(idx) = self.history_state.selected() {
+                        if let Some(conv) = self.snap.history.get(idx) {
+                            let id = conv.id;
+                            self.auto_scroll = true;
+                            self.focus = FocusPane::Chat;
+                            self.send_cmd(&ClientCmd::LoadConversation { id });
+                        }
+                    }
+                }
+                FocusPane::Inspector if !self.preview_open => {
+                    if let Some(idx) = self.inspector_model_state.selected() {
+                        if let Some(model) = self.snap.models.get(idx).cloned() {
+                            self.send_cmd(&ClientCmd::SelectModel { model });
+                        }
+                    }
+                }
+                _ => {
+                    self.focus = FocusPane::Chat;
+                    self.vim_mode = VimMode::Insert;
+                }
+            },
+            KeyCode::Char('g') => {
+                if was_g {
+                    self.auto_scroll = false;
+                    if self.focus == FocusPane::Inspector && self.preview_open {
+                        self.preview_scroll = 0;
+                    } else {
+                        self.scroll_offset = 0;
+                    }
+                } else {
+                    self.pending_g = true;
+                }
+            }
+            KeyCode::Char('G') => {
+                if self.focus == FocusPane::Inspector && self.preview_open {
+                    self.preview_scroll = u16::MAX / 2;
+                } else {
+                    self.auto_scroll = true;
+                }
+            }
+            KeyCode::Char('n') => self.jump_search_match(true),
+            KeyCode::Char('N') => self.jump_search_match(false),
+            KeyCode::Char('p') => self.toggle_artifact_preview(),
+            KeyCode::Char('x') if self.preview_open => {
+                self.preview_open = false;
+                if self.focus == FocusPane::Inspector {
+                    self.focus = FocusPane::Chat;
+                }
+            }
+            KeyCode::Char('s') => {
+                let next_side = if self.snap.preview_side == "left" {
+                    "right"
+                } else {
+                    "left"
+                };
+                self.send_cmd(&ClientCmd::SetPreviewSide {
+                    side: next_side.to_string(),
+                });
+            }
+            KeyCode::Char('[') if self.preview_open && !self.preview_artifacts.is_empty() => {
+                self.preview_idx = self.preview_idx.saturating_sub(1);
+                self.preview_scroll = 0;
+            }
+            KeyCode::Char(']') if self.preview_open && !self.preview_artifacts.is_empty() => {
+                self.preview_idx = (self.preview_idx + 1).min(self.preview_artifacts.len() - 1);
+                self.preview_scroll = 0;
+            }
+            KeyCode::Char('y') => {
+                if self.focus == FocusPane::Inspector && self.preview_open {
+                    if let Some(art) = self.preview_artifacts.get(self.preview_idx).cloned() {
+                        self.copy_text_to_clipboard(
+                            &art.content,
+                            &format!("Copied {} to clipboard", art.title),
+                        );
+                        return;
+                    }
+                }
+                self.open_copy_modal();
+            }
+            KeyCode::Char('m') => self.open_model_modal(),
+            KeyCode::Char('r') => self.send_cmd(&ClientCmd::FetchModels),
+            KeyCode::F(2) => self.open_provider_modal(),
+            KeyCode::F(3) => self.open_model_modal(),
+            KeyCode::F(4) => self.open_history_modal(),
+            KeyCode::F(5) => self.send_cmd(&ClientCmd::FetchModels),
+            KeyCode::PageUp => {
+                self.auto_scroll = false;
+                self.scroll_offset = self.scroll_offset.saturating_sub(10);
+            }
+            KeyCode::PageDown => {
+                self.auto_scroll = false;
+                self.scroll_offset = self.scroll_offset.saturating_add(10);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_search_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc => {
+                self.vim_mode = VimMode::Normal;
+                self.search_query.clear();
+                self.search_matches.clear();
+            }
+            KeyCode::Enter => {
+                self.vim_mode = VimMode::Normal;
+                if !self.search_matches.is_empty() {
+                    self.jump_search_match(true);
+                }
+            }
+            KeyCode::Backspace => {
+                self.search_query.pop();
+                self.update_search_matches();
+            }
+            KeyCode::Char(c) => {
+                self.search_query.push(c);
+                self.update_search_matches();
+            }
+            _ => {}
+        }
+    }
+
+    fn update_search_matches(&mut self) {
+        self.search_matches.clear();
+        self.search_match_idx = 0;
+        let q = self.search_query.trim().to_ascii_lowercase();
+        if q.is_empty() {
+            return;
+        }
+        let mut row = 0usize;
+        for msg in &self.snap.messages {
+            row += 1; // header line
+            for line in msg.content.lines() {
+                if line.to_ascii_lowercase().contains(&q) {
+                    self.search_matches.push(row);
+                }
+                row += 1;
+            }
+            row += 2; // footer + spacer
+        }
+    }
+
+    fn jump_search_match(&mut self, forward: bool) {
+        if self.search_matches.is_empty() {
+            if !self.search_query.trim().is_empty() {
+                self.local_notice = Some(format!("Pattern not found: {}", self.search_query));
+            }
+            return;
+        }
+        if forward {
+            self.search_match_idx = (self.search_match_idx + 1) % self.search_matches.len();
+        } else {
+            self.search_match_idx = if self.search_match_idx == 0 {
+                self.search_matches.len() - 1
+            } else {
+                self.search_match_idx - 1
+            };
+        }
+        let target_row = self.search_matches[self.search_match_idx];
+        self.auto_scroll = false;
+        self.scroll_offset = (target_row as u16).saturating_sub(3);
+        self.local_notice = Some(format!(
+            "Match {}/{} for '{}'",
+            self.search_match_idx + 1,
+            self.search_matches.len(),
+            self.search_query
+        ));
+    }
+
+    fn handle_command_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc => {
+                self.vim_mode = VimMode::Normal;
+                self.command_buf.clear();
+            }
+            KeyCode::Backspace => {
+                self.command_buf.pop();
+            }
+            KeyCode::Enter => {
+                let cmd = self.command_buf.trim().to_string();
+                self.command_buf.clear();
+                self.vim_mode = VimMode::Normal;
+                self.execute_vim_command(&cmd);
+            }
+            KeyCode::Char(c) => self.command_buf.push(c),
+            _ => {}
+        }
+    }
+
+    fn execute_vim_command(&mut self, raw: &str) {
+        let mut parts = raw.split_whitespace();
+        let Some(cmd) = parts.next() else {
+            return;
+        };
+        let arg = parts.next().unwrap_or("");
+        match cmd {
+            "q" | "quit" | "wq" => self.should_quit = true,
+            "new" | "clear" => {
+                self.scroll_offset = 0;
+                self.preview_open = false;
+                self.send_cmd(&ClientCmd::NewChat);
+            }
+            "p" | "preview" => self.toggle_artifact_preview(),
+            "close" | "pc" => {
+                self.preview_open = false;
+                self.focus = FocusPane::Chat;
+            }
+            "side" => {
+                if arg.eq_ignore_ascii_case("left") || arg.eq_ignore_ascii_case("right") {
+                    self.send_cmd(&ClientCmd::SetPreviewSide {
+                        side: arg.to_ascii_lowercase(),
+                    });
+                } else {
+                    self.local_notice = Some("Usage: :side left | :side right".into());
+                }
+            }
+            "m" | "model" => self.open_model_modal(),
+            "prov" | "provider" => self.open_provider_modal(),
+            "hist" | "history" => self.open_history_modal(),
+            "y" | "yank" | "copy" => self.open_copy_modal(),
+            "r" | "refresh" => self.send_cmd(&ClientCmd::FetchModels),
+            "o" | "open" => self.open_markdown_picker(),
+            "h" | "help" => self.modal = Modal::Help,
+            _ => {
+                self.local_notice = Some(format!("Unknown command: :{cmd} (try :help)"));
+            }
         }
     }
 
@@ -1195,6 +1862,16 @@ impl TuiClient {
             return;
         }
 
+        if matches!(self.modal, Modal::Help) {
+            match code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Enter => {
+                    self.modal = Modal::None;
+                }
+                _ => {}
+            }
+            return;
+        }
+
         match code {
             KeyCode::Esc => {
                 self.modal = Modal::None;
@@ -1250,6 +1927,7 @@ impl TuiClient {
                 }
             }
             Modal::None
+            | Modal::Help
             | Modal::MarkdownPicker { .. }
             | Modal::MarkdownViewer { .. }
             | Modal::CopyPicker { .. }
@@ -1259,7 +1937,9 @@ impl TuiClient {
 
     fn modal_len(&self) -> usize {
         match &self.modal {
-            Modal::None | Modal::MarkdownViewer { .. } | Modal::CopyLines { .. } => 0,
+            Modal::None | Modal::Help | Modal::MarkdownViewer { .. } | Modal::CopyLines { .. } => {
+                0
+            }
             Modal::Provider(_) => self.snap.providers.len(),
             Modal::Model(_) => self.snap.models.len(),
             Modal::History(_) => self.snap.history.len(),
@@ -1270,7 +1950,9 @@ impl TuiClient {
 
     fn modal_state_mut(&mut self) -> Option<&mut ListState> {
         match &mut self.modal {
-            Modal::None | Modal::MarkdownViewer { .. } | Modal::CopyLines { .. } => None,
+            Modal::None | Modal::Help | Modal::MarkdownViewer { .. } | Modal::CopyLines { .. } => {
+                None
+            }
             Modal::Provider(s)
             | Modal::Model(s)
             | Modal::History(s)
@@ -1279,7 +1961,327 @@ impl TuiClient {
         }
     }
 
+    fn render_history_sidebar(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect) {
+        let focused = self.focus == FocusPane::History;
+        let border_color = if focused {
+            Color::LightCyan
+        } else {
+            Color::Rgb(65, 85, 115)
+        };
+        let items: Vec<ListItem<'_>> = if self.snap.history.is_empty() {
+            vec![ListItem::new(Span::styled(
+                "No saved chats yet",
+                Style::default().fg(Color::DarkGray),
+            ))]
+        } else {
+            self.snap
+                .history
+                .iter()
+                .map(|c| {
+                    let is_active = self.snap.active_conversation_id == Some(c.id);
+                    let marker = if is_active { "● " } else { "  " };
+                    let title_style = if is_active {
+                        Style::default()
+                            .fg(Color::LightGreen)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    ListItem::new(vec![
+                        Line::from(vec![
+                            Span::styled(marker, Style::default().fg(Color::LightGreen)),
+                            Span::styled(c.title.clone(), title_style),
+                        ]),
+                        Line::from(Span::styled(
+                            format!("  {}", c.model),
+                            Style::default().fg(Color::DarkGray),
+                        )),
+                    ])
+                })
+                .collect()
+        };
+        let title = if focused {
+            " Recent Chats (j/k:Move Enter:Load) "
+        } else {
+            " Recent Chats (Ctrl+W h) "
+        };
+        let list = List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(border_color))
+                    .title(Span::styled(
+                        title,
+                        Style::default()
+                            .fg(if focused {
+                                Color::LightCyan
+                            } else {
+                                Color::Gray
+                            })
+                            .add_modifier(Modifier::BOLD),
+                    )),
+            )
+            .highlight_style(
+                Style::default()
+                    .bg(Color::Rgb(36, 62, 102))
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("▶ ");
+        frame.render_stateful_widget(list, area, &mut self.history_state);
+    }
+
+    fn render_preview_panel(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect) {
+        let focused = self.focus == FocusPane::Inspector;
+        let border_color = if focused {
+            Color::LightGreen
+        } else {
+            Color::Rgb(75, 130, 100)
+        };
+        let inner_w = area.width.saturating_sub(4).max(20) as usize;
+        let (title, body_lines): (String, Vec<Line<'static>>) =
+            if let Some(art) = self.preview_artifacts.get(self.preview_idx) {
+                let t = format!(
+                    " Preview [{}/{}] {} (s:Side x:Close) ",
+                    self.preview_idx + 1,
+                    self.preview_artifacts.len().max(1),
+                    art.title
+                );
+                let mut out = Vec::new();
+                match art.kind.as_str() {
+                    "markdown" => out.extend(render_markdown_lines(&art.content, None, inner_w)),
+                    "html" => {
+                        let md = html_to_readable_markdown(&art.content);
+                        out.extend(render_markdown_lines(&md, None, inner_w));
+                    }
+                    _ => {
+                        let fenced = format!("```{}\n{}\n```", art.kind, art.content);
+                        out.extend(render_markdown_lines(&fenced, None, inner_w));
+                    }
+                }
+                (t, out)
+            } else {
+                (
+                    " Preview (Empty) ".to_string(),
+                    vec![Line::from(Span::styled(
+                        "No artifact generated yet.",
+                        Style::default().fg(Color::DarkGray),
+                    ))],
+                )
+            };
+
+        let p = Paragraph::new(body_lines)
+            .wrap(Wrap { trim: false })
+            .scroll((self.preview_scroll, 0))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(border_color))
+                    .title(Span::styled(
+                        title,
+                        Style::default()
+                            .fg(Color::LightGreen)
+                            .add_modifier(Modifier::BOLD),
+                    )),
+            );
+        frame.render_widget(p, area);
+    }
+
+    fn render_inspector_panel(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect) {
+        let focused = self.focus == FocusPane::Inspector;
+        let border_color = if focused {
+            Color::LightYellow
+        } else {
+            Color::Rgb(85, 80, 120)
+        };
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(10), Constraint::Min(5)])
+            .split(area);
+
+        let (ctx_win, tier, api_proto) =
+            infer_model_specs(&self.snap.model, &self.snap.provider_kind);
+        let msg_count = self.snap.messages.len();
+        let specs_lines = vec![
+            Line::from(vec![
+                Span::styled("Provider: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    self.snap.provider_name.clone(),
+                    Style::default()
+                        .fg(Color::LightCyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Model:    ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    self.snap.model.clone(),
+                    Style::default()
+                        .fg(Color::LightYellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Context:  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(ctx_win, Style::default().fg(Color::LightGreen)),
+            ]),
+            Line::from(vec![
+                Span::styled("Tier:     ", Style::default().fg(Color::DarkGray)),
+                Span::styled(tier, Style::default().fg(Color::LightMagenta)),
+            ]),
+            Line::from(vec![
+                Span::styled("API:      ", Style::default().fg(Color::DarkGray)),
+                Span::styled(api_proto, Style::default().fg(Color::White)),
+            ]),
+            Line::from(vec![
+                Span::styled("Auth:     ", Style::default().fg(Color::DarkGray)),
+                Span::styled(self.snap.provider_auth.clone(), Style::default().fg(Color::Gray)),
+            ]),
+            Line::from(vec![
+                Span::styled("Session:  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("{msg_count} msgs | Side:{}", self.snap.preview_side), Style::default().fg(Color::Gray)),
+            ]),
+        ];
+        let specs_box = Paragraph::new(specs_lines)
+            .wrap(Wrap { trim: true })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(border_color))
+                    .title(Span::styled(
+                        " Model Specs ",
+                        Style::default()
+                            .fg(Color::LightYellow)
+                            .add_modifier(Modifier::BOLD),
+                    )),
+            );
+        frame.render_widget(specs_box, sections[0]);
+
+        let model_items: Vec<ListItem<'_>> = if self.snap.models.is_empty() {
+            vec![ListItem::new(Span::styled(
+                "Press r to fetch models",
+                Style::default().fg(Color::DarkGray),
+            ))]
+        } else {
+            self.snap
+                .models
+                .iter()
+                .map(|m| {
+                    let active = m == &self.snap.model;
+                    let prefix = if active { "★ " } else { "  " };
+                    ListItem::new(Line::from(vec![
+                        Span::styled(prefix, Style::default().fg(Color::LightYellow)),
+                        Span::styled(
+                            m.clone(),
+                            if active {
+                                Style::default()
+                                    .fg(Color::LightYellow)
+                                    .add_modifier(Modifier::BOLD)
+                            } else {
+                                Style::default().fg(Color::White)
+                            },
+                        ),
+                    ]))
+                })
+                .collect()
+        };
+        let switcher_title = if focused {
+            " Switch Model (j/k Enter | r:Fetch) "
+        } else {
+            " Models (Ctrl+W l to switch) "
+        };
+        let model_list = List::new(model_items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(border_color))
+                    .title(Span::styled(
+                        switcher_title,
+                        Style::default()
+                            .fg(if focused {
+                                Color::LightYellow
+                            } else {
+                                Color::Gray
+                            })
+                            .add_modifier(Modifier::BOLD),
+                    )),
+            )
+            .highlight_style(
+                Style::default()
+                    .bg(Color::Rgb(85, 65, 25))
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("▶ ");
+        frame.render_stateful_widget(model_list, sections[1], &mut self.inspector_model_state);
+    }
+
     fn render(&mut self, frame: &mut ratatui::Frame<'_>) {
+        let full_area = frame.area();
+        let wide_mode = full_area.width >= 104;
+
+        // Responsive 3-pane centered layout when wide/fullscreen, or 2-pane split when preview open in compact mode
+        let (left_area, center_area, right_area): (Option<Rect>, Rect, Option<Rect>) = if wide_mode {
+            let max_center = 104u16;
+            let side_total = full_area.width.saturating_sub(max_center);
+            let cols = if full_area.width > 180 {
+                let side_each = (side_total / 2).max(30);
+                Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([
+                        Constraint::Length(side_each),
+                        Constraint::Min(max_center),
+                        Constraint::Length(side_each),
+                    ])
+                    .split(full_area)
+            } else {
+                Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([
+                        Constraint::Percentage(23),
+                        Constraint::Percentage(52),
+                        Constraint::Percentage(25),
+                    ])
+                    .split(full_area)
+            };
+            (Some(cols[0]), cols[1], Some(cols[2]))
+        } else if self.preview_open {
+            if self.snap.preview_side == "left" {
+                let cols = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
+                    .split(full_area);
+                (Some(cols[0]), cols[1], None)
+            } else {
+                let cols = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Percentage(54), Constraint::Percentage(46)])
+                    .split(full_area);
+                (None, cols[0], Some(cols[1]))
+            }
+        } else {
+            (None, full_area, None)
+        };
+
+        if let Some(la) = left_area {
+            if self.preview_open && self.snap.preview_side == "left" {
+                self.render_preview_panel(frame, la);
+            } else {
+                self.render_history_sidebar(frame, la);
+            }
+        }
+        if let Some(ra) = right_area {
+            if self.preview_open && self.snap.preview_side != "left" {
+                self.render_preview_panel(frame, ra);
+            } else if wide_mode {
+                self.render_inspector_panel(frame, ra);
+            }
+        }
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -1288,10 +2290,40 @@ impl TuiClient {
                 Constraint::Length(3),
                 Constraint::Length(1),
             ])
-            .split(frame.area());
+            .split(center_area);
 
-        // Colorful Antigravity-inspired header pills
+        // Colorful Antigravity-inspired header pills + Vim Mode indicator
         let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][self.tick % 10];
+        let mode_badge = match self.vim_mode {
+            VimMode::Insert => Span::styled(
+                " INSERT ",
+                Style::default()
+                    .bg(Color::Rgb(22, 115, 70))
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            VimMode::Normal => Span::styled(
+                " NORMAL ",
+                Style::default()
+                    .bg(Color::Rgb(30, 95, 155))
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            VimMode::Search => Span::styled(
+                " SEARCH ",
+                Style::default()
+                    .bg(Color::Rgb(150, 110, 20))
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            VimMode::Command => Span::styled(
+                " CMD ",
+                Style::default()
+                    .bg(Color::Rgb(135, 50, 145))
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        };
         let linux_badge = if self.snap.linux_quick_mode {
             Span::styled(
                 " Linux:ON ",
@@ -1324,6 +2356,8 @@ impl TuiClient {
         };
 
         let header = Paragraph::new(Line::from(vec![
+            mode_badge,
+            Span::raw(" "),
             Span::styled(
                 " ✦ HyprPilot ",
                 Style::default()
@@ -1359,7 +2393,7 @@ impl TuiClient {
         );
         frame.render_widget(header, chunks[0]);
 
-        // Colorful Chat Transcript
+        // Colorful Chat Transcript (with search match highlights if active)
         let inner_width = chunks[1].width.saturating_sub(6).max(30) as usize;
         let mut lines: Vec<Line<'static>> = Vec::new();
         if self.snap.messages.is_empty() && !self.snap.streaming {
@@ -1374,7 +2408,7 @@ impl TuiClient {
                 ),
             ]));
             lines.push(Line::from(Span::styled(
-                "    Try: \"how to find a directory inside linux\"  |  Ctrl+O: Open .md  |  Ctrl+G: History",
+                "    Esc: Normal mode (Vim motions, / search, : commands) | p: Preview | ?: Help",
                 Style::default().fg(Color::DarkGray),
             )));
         } else {
@@ -1405,6 +2439,18 @@ impl TuiClient {
             }
         }
 
+        if !self.search_query.trim().is_empty() {
+            let q = self.search_query.trim().to_ascii_lowercase();
+            for line in &mut lines {
+                let plain: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                if plain.to_ascii_lowercase().contains(&q) {
+                    for sp in &mut line.spans {
+                        sp.style = sp.style.bg(Color::Rgb(75, 62, 18));
+                    }
+                }
+            }
+        }
+
         let inner_width = chunks[1].width.saturating_sub(2).max(1) as usize;
         let inner_height = chunks[1].height.saturating_sub(2);
         let total_wrapped_rows: usize = lines
@@ -1418,6 +2464,7 @@ impl TuiClient {
             self.scroll_offset = self.scroll_offset.min(max_scroll);
         }
 
+        let chat_focused = self.focus == FocusPane::Chat;
         let transcript = Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .scroll((self.scroll_offset, 0))
@@ -1425,9 +2472,21 @@ impl TuiClient {
                 Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(Color::Rgb(70, 120, 165)))
+                    .border_style(Style::default().fg(if chat_focused {
+                        Color::Rgb(80, 145, 205)
+                    } else {
+                        Color::Rgb(55, 80, 110)
+                    }))
                     .title(Span::styled(
-                        " Conversation ",
+                        if self.search_matches.is_empty() {
+                            " Conversation ".to_string()
+                        } else {
+                            format!(
+                                " Conversation [Match {}/{}] ",
+                                self.search_match_idx + 1,
+                                self.search_matches.len()
+                            )
+                        },
                         Style::default()
                             .fg(Color::LightCyan)
                             .add_modifier(Modifier::BOLD),
@@ -1436,6 +2495,17 @@ impl TuiClient {
         frame.render_widget(transcript, chunks[1]);
 
         // Input Box
+        let cursor_span = if self.vim_mode == VimMode::Insert {
+            Span::styled("█", Style::default().fg(Color::LightCyan))
+        } else {
+            Span::styled(" ", Style::default())
+        };
+        let input_title = match self.vim_mode {
+            VimMode::Insert => " Ask (Enter: Send | Esc: Normal Mode | Ctrl+Bksp: Del Word) ",
+            VimMode::Normal => " Normal Mode (i: Insert | j/k: Scroll | /: Search | :: Cmd | ?: Help) ",
+            VimMode::Search => " Search Mode (Enter: Jump | Esc: Cancel) ",
+            VimMode::Command => " Command Mode (Enter: Run | Esc: Cancel) ",
+        };
         let input_box = Paragraph::new(Line::from(vec![
             Span::styled(
                 " ❯ ",
@@ -1444,7 +2514,7 @@ impl TuiClient {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(self.input.clone(), Style::default().fg(Color::White)),
-            Span::styled("█", Style::default().fg(Color::LightCyan)),
+            cursor_span,
         ]))
         .block(
             Block::default()
@@ -1452,31 +2522,113 @@ impl TuiClient {
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(if self.snap.streaming {
                     Color::Yellow
+                } else if self.vim_mode == VimMode::Normal {
+                    Color::Rgb(95, 135, 195)
                 } else {
                     Color::LightCyan
                 }))
                 .title(Span::styled(
-                    " Ask (Enter: Send | Ctrl+Bksp: Del Word) ",
+                    input_title,
                     Style::default().fg(Color::LightBlue),
                 )),
         );
         frame.render_widget(input_box, chunks[2]);
 
-        // Colorful Shortcut Footer
-        let footer = Paragraph::new(Line::from(vec![
-            key_chip("F2/Ctrl+P", "Provider"),
-            key_chip("F3/Ctrl+M", "Model"),
-            key_chip("Ctrl+O", "Open.md"),
-            key_chip("F4/Ctrl+G", "History"),
-            key_chip("Ctrl+N", "New"),
-            key_chip("Ctrl+Y", "Copy Section"),
-            key_chip("Esc", "Hide"),
-        ]));
+        // Bottom Bar: Vim Search / Command prompt or contextual shortcut chips
+        let footer = match self.vim_mode {
+            VimMode::Search => Paragraph::new(Line::from(vec![
+                Span::styled(
+                    " /",
+                    Style::default()
+                        .fg(Color::LightYellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(self.search_query.clone(), Style::default().fg(Color::White)),
+                Span::styled("█  ", Style::default().fg(Color::LightYellow)),
+                Span::styled(
+                    format!("({} matches)", self.search_matches.len()),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])),
+            VimMode::Command => Paragraph::new(Line::from(vec![
+                Span::styled(
+                    " :",
+                    Style::default()
+                        .fg(Color::LightMagenta)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(self.command_buf.clone(), Style::default().fg(Color::White)),
+                Span::styled("█", Style::default().fg(Color::LightMagenta)),
+            ])),
+            VimMode::Normal => Paragraph::new(Line::from(vec![
+                key_chip("i", "Insert"),
+                key_chip("/", "Search"),
+                key_chip(":", "Cmd"),
+                key_chip("p", "Preview"),
+                key_chip("s", "Side"),
+                key_chip("y", "Copy"),
+                key_chip("Ctrl+W", "Pane"),
+                key_chip("?", "Help"),
+                key_chip("q", "Hide"),
+            ])),
+            VimMode::Insert => Paragraph::new(Line::from(vec![
+                key_chip("Esc", "Normal"),
+                key_chip("Ctrl+P", "Provider"),
+                key_chip("Ctrl+M", "Model"),
+                key_chip("Ctrl+E", "Preview"),
+                key_chip("Ctrl+G", "History"),
+                key_chip("Ctrl+Y", "Copy"),
+                key_chip("Ctrl+Q", "Quit"),
+            ])),
+        };
         frame.render_widget(footer, chunks[3]);
 
         // Modals
         match &mut self.modal {
             Modal::None => {}
+            Modal::Help => {
+                let area = centered_rect(76, 76, frame.area());
+                frame.render_widget(Clear, area);
+                let help_lines = vec![
+                    Line::from(Span::styled(
+                        "  Neovim / Vim Navigation & Commands",
+                        Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(""),
+                    Line::from("  Esc (Insert)     -> Enter Normal Mode"),
+                    Line::from("  i / a / o        -> Enter Insert Mode"),
+                    Line::from("  q / Esc (Normal) -> Hide / Exit TUI"),
+                    Line::from("  j / k / Ctrl+D/U -> Scroll down / up / half-page"),
+                    Line::from("  gg / G           -> Jump to top / bottom"),
+                    Line::from("  /query           -> Search transcript (n / N: next / prev match)"),
+                    Line::from("  :cmd             -> :new  :p(review)  :side left|right  :model  :copy  :q"),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "  3-Pane Layout & Live Artifact Preview",
+                        Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(""),
+                    Line::from("  Ctrl+W h / l / w -> Focus Recent Chats (Left) / Chat / Model & Preview (Right)"),
+                    Line::from("  Tab              -> Cycle pane focus (Enter loads chat or switches model)"),
+                    Line::from("  p / Ctrl+E       -> Toggle Live Markdown / HTML / Code Artifact Preview"),
+                    Line::from("  s                -> Swap Preview side (left <-> right, persisted)"),
+                    Line::from("  [ / ]            -> Switch between artifacts in current reply"),
+                    Line::from("  y / Ctrl+Y       -> Copy clean section or Visual Line-Range (zero borders)"),
+                ];
+                let p = Paragraph::new(help_lines)
+                    .wrap(Wrap { trim: false })
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .border_style(Style::default().fg(Color::LightCyan))
+                            .title(Span::styled(
+                                " HyprPilot TUI Help (Esc / q to close) ",
+                                Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD),
+                            )),
+                    );
+                frame.render_widget(p, area);
+            }
             Modal::Provider(st) => {
                 let items: Vec<ListItem<'_>> = self
                     .snap
@@ -2190,5 +3342,23 @@ mod tests {
         assert!(!secs[2].content.contains("│"));
         assert_eq!(secs[3].kind, "TEXT");
         assert_eq!(secs[3].content, "Done.");
+    }
+
+    #[test]
+    fn extracts_markdown_artifacts_and_infers_model_specs() {
+        let msgs = vec![WireMessage {
+            role: "assistant".into(),
+            content: "Here is your doc:\n```markdown\n# Plan\n- Step 1\n```\n".into(),
+        }];
+        assert!(has_rich_md_artifact(&msgs));
+        let arts = extract_artifacts(&msgs);
+        assert_eq!(arts.len(), 1);
+        assert_eq!(arts[0].kind, "markdown");
+        assert!(arts[0].content.contains("# Plan"));
+
+        let (ctx, tier, api) = infer_model_specs("gemini-2.5-flash-lite", "Gemini");
+        assert_eq!(ctx, "1M tokens");
+        assert_eq!(tier, "Fast / Low-Token");
+        assert_eq!(api, "Gemini GenerateContent");
     }
 }
