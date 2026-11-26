@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use crossterm::event::{
-    self, Event, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -1008,7 +1009,12 @@ struct TerminalGuard;
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags, LeaveAlternateScreen);
+        let _ = execute!(
+            io::stdout(),
+            DisableMouseCapture,
+            PopKeyboardEnhancementFlags,
+            LeaveAlternateScreen
+        );
         let _ = disable_raw_mode();
     }
 }
@@ -1040,6 +1046,14 @@ struct TuiClient {
     history_state: ListState,
     inspector_model_state: ListState,
     force_panes: Option<bool>,
+    chat_zoomed: bool,
+    last_transcript_rect: Rect,
+    last_left_rect: Option<Rect>,
+    last_right_rect: Option<Rect>,
+    rendered_transcript_lines: Vec<String>,
+    drag_anchor: Option<(usize, usize)>,
+    drag_cursor: Option<(usize, usize)>,
+    dragging: bool,
 }
 
 impl TuiClient {
@@ -1095,6 +1109,14 @@ impl TuiClient {
             history_state: ListState::default(),
             inspector_model_state: ListState::default(),
             force_panes: None,
+            chat_zoomed: false,
+            last_transcript_rect: Rect::default(),
+            last_left_rect: None,
+            last_right_rect: None,
+            rendered_transcript_lines: Vec::new(),
+            drag_anchor: None,
+            drag_cursor: None,
+            dragging: false,
         };
         client.send_cmd(&ClientCmd::GetState);
         Ok(client)
@@ -1190,6 +1212,90 @@ impl TuiClient {
         }
     }
 
+    fn handle_mouse(&mut self, me: MouseEvent) {
+        if !matches!(self.modal, Modal::None) {
+            return;
+        }
+        let tr = self.last_transcript_rect;
+        let inner_x_min = tr.x.saturating_add(1);
+        let inner_x_max = tr.x.saturating_add(tr.width.saturating_sub(2)).max(inner_x_min);
+        let inner_y_min = tr.y.saturating_add(1);
+        let inner_y_max = tr.y.saturating_add(tr.height.saturating_sub(2)).max(inner_y_min);
+
+        let clamp_to_transcript = |col: u16, row: u16| -> (usize, usize) {
+            let cx = col.clamp(inner_x_min, inner_x_max).saturating_sub(inner_x_min) as usize;
+            let cy = row.clamp(inner_y_min, inner_y_max).saturating_sub(inner_y_min) as usize;
+            (cy + self.scroll_offset as usize, cx)
+        };
+
+        match me.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if me.column >= tr.x
+                    && me.column < tr.x + tr.width
+                    && me.row >= tr.y
+                    && me.row < tr.y + tr.height
+                {
+                    let pos = clamp_to_transcript(me.column, me.row);
+                    self.drag_anchor = Some(pos);
+                    self.drag_cursor = Some(pos);
+                    self.dragging = true;
+                    self.focus = FocusPane::Chat;
+                } else {
+                    self.drag_anchor = None;
+                    self.drag_cursor = None;
+                    self.dragging = false;
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.dragging => {
+                // Strictly clamped to the center transcript pane — never bleeds into sidebars!
+                self.drag_cursor = Some(clamp_to_transcript(me.column, me.row));
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.dragging => {
+                self.dragging = false;
+                self.drag_cursor = Some(clamp_to_transcript(me.column, me.row));
+                if let (Some(a), Some(b)) = (self.drag_anchor, self.drag_cursor) {
+                    if a != b {
+                        let text = extract_pane_selection(&self.rendered_transcript_lines, a, b);
+                        if !text.trim().is_empty() {
+                            let len = text.chars().count();
+                            self.copy_text_to_clipboard(
+                                &text,
+                                &format!("Copied {len} chars from chat (sidebars excluded)"),
+                            );
+                        }
+                    }
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                if let Some(rr) = self.last_right_rect {
+                    if self.preview_open
+                        && me.column >= rr.x
+                        && me.column < rr.x + rr.width
+                    {
+                        self.preview_scroll = self.preview_scroll.saturating_sub(3);
+                        return;
+                    }
+                }
+                self.auto_scroll = false;
+                self.scroll_offset = self.scroll_offset.saturating_sub(3);
+            }
+            MouseEventKind::ScrollDown => {
+                if let Some(rr) = self.last_right_rect {
+                    if self.preview_open
+                        && me.column >= rr.x
+                        && me.column < rr.x + rr.width
+                    {
+                        self.preview_scroll = self.preview_scroll.saturating_add(3);
+                        return;
+                    }
+                }
+                self.auto_scroll = false;
+                self.scroll_offset = self.scroll_offset.saturating_add(3);
+            }
+            _ => {}
+        }
+    }
+
     fn open_copy_modal(&mut self) {
         let Some(last) = self
             .snap
@@ -1282,6 +1388,10 @@ impl TuiClient {
                 }
                 KeyCode::Char('b') => {
                     self.force_panes = Some(!self.force_panes.unwrap_or(false));
+                    self.chat_zoomed = false;
+                }
+                KeyCode::Char('z') => {
+                    self.chat_zoomed = !self.chat_zoomed;
                 }
                 KeyCode::Left => {
                     self.vim_mode = VimMode::Normal;
@@ -1642,6 +1752,7 @@ impl TuiClient {
                 self.open_copy_modal();
             }
             KeyCode::Char('m') => self.open_model_modal(),
+            KeyCode::Char('z') => self.chat_zoomed = !self.chat_zoomed,
             KeyCode::Char('r') => self.send_cmd(&ClientCmd::FetchModels),
             KeyCode::F(2) => self.open_provider_modal(),
             KeyCode::F(3) => self.open_model_modal(),
@@ -1796,6 +1907,10 @@ impl TuiClient {
             }
             "panes" => {
                 self.force_panes = Some(!self.force_panes.unwrap_or(false));
+                self.chat_zoomed = false;
+            }
+            "z" | "zoom" => {
+                self.chat_zoomed = !self.chat_zoomed;
             }
             "m" | "model" => self.open_model_modal(),
             "prov" | "provider" => self.open_provider_modal(),
@@ -2613,10 +2728,12 @@ impl TuiClient {
         let full_area = frame.area();
         // Only enable 3-pane layout in true fullscreen/wide terminals (>= 150 cols),
         // keeping the initial ~50% Alt+Space popup focused on Chat only (unless preview is open or forced).
-        let wide_mode = self.force_panes.unwrap_or(full_area.width >= 150);
+        let wide_mode = !self.chat_zoomed && self.force_panes.unwrap_or(full_area.width >= 150);
         let [r_left, r_center, r_right] = self.snap.pane_ratios;
 
-        let (left_area, center_area, right_area): (Option<Rect>, Rect, Option<Rect>) = if wide_mode {
+        let (left_area, center_area, right_area): (Option<Rect>, Rect, Option<Rect>) = if self.chat_zoomed {
+            (None, full_area, None)
+        } else if wide_mode {
             let cols = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([
@@ -2643,6 +2760,9 @@ impl TuiClient {
         } else {
             (None, full_area, None)
         };
+
+        self.last_left_rect = left_area;
+        self.last_right_rect = right_area;
 
         if let Some(la) = left_area {
             if self.preview_open && self.snap.preview_side == "left" {
@@ -2823,6 +2943,24 @@ impl TuiClient {
                 if plain.to_ascii_lowercase().contains(&q) {
                     for sp in &mut line.spans {
                         sp.style = sp.style.bg(Color::Rgb(75, 62, 18));
+                    }
+                }
+            }
+        }
+
+        // Record plain text rows for pane-clamped selection and highlight active drag range
+        self.rendered_transcript_lines = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        self.last_transcript_rect = chunks[1];
+
+        if let (Some(a), Some(b)) = (self.drag_anchor, self.drag_cursor) {
+            let (r_lo, r_hi) = if a.0 <= b.0 { (a.0, b.0) } else { (b.0, a.0) };
+            for (idx, line) in lines.iter_mut().enumerate() {
+                if idx >= r_lo && idx <= r_hi {
+                    for sp in &mut line.spans {
+                        sp.style = sp.style.bg(Color::Rgb(42, 72, 118));
                     }
                 }
             }
@@ -3535,6 +3673,58 @@ fn wrap_styled_line_preserving_prefix(
     rows
 }
 
+fn strip_transcript_row_prefix(row: &str) -> &str {
+    if let Some(rest) = row.strip_prefix(" │ ") {
+        rest
+    } else if row.starts_with(" ╭─ ") || row.starts_with(" ╰──") {
+        ""
+    } else {
+        row
+    }
+}
+
+fn extract_pane_selection(
+    rows: &[String],
+    anchor: (usize, usize),
+    cursor: (usize, usize),
+) -> String {
+    if rows.is_empty() {
+        return String::new();
+    }
+    let ((r0, c0), (r1, c1)) = if anchor <= cursor {
+        (anchor, cursor)
+    } else {
+        (cursor, anchor)
+    };
+    let r_start = r0.min(rows.len() - 1);
+    let r_end = r1.min(rows.len() - 1);
+
+    let mut out = Vec::new();
+    for (idx, row) in rows.iter().enumerate().take(r_end + 1).skip(r_start) {
+        let chars: Vec<char> = row.chars().collect();
+        let lo = if idx == r_start { c0.min(chars.len()) } else { 0 };
+        let hi = if idx == r_end {
+            c1.saturating_add(1).min(chars.len())
+        } else {
+            chars.len()
+        };
+        let slice: String = if lo < hi {
+            chars[lo..hi].iter().collect()
+        } else {
+            String::new()
+        };
+        let cleaned = if lo == 0 {
+            strip_transcript_row_prefix(&slice)
+        } else {
+            slice.as_str()
+        };
+        if !cleaned.trim().is_empty() {
+            out.push(cleaned.trim_end().to_string());
+        }
+    }
+    out.join("\n")
+}
+
 fn render_styled_message(
     out: &mut Vec<Line<'static>>,
     role: &str,
@@ -3916,7 +4106,7 @@ fn main() -> Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let _ = execute!(
         stdout,
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
@@ -3932,10 +4122,14 @@ fn main() -> Result<()> {
         terminal.draw(|f| client.render(f))?;
 
         if event::poll(Duration::from_millis(45))? {
-            if let Event::Key(key) = event::read()? {
-                if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-                    client.handle_key(key.code, key.modifiers);
+            match event::read()? {
+                Event::Key(key) => {
+                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                        client.handle_key(key.code, key.modifiers);
+                    }
                 }
+                Event::Mouse(me) => client.handle_mouse(me),
+                _ => {}
             }
         }
     }
@@ -4026,5 +4220,19 @@ mod tests {
             assert_eq!(l.spans[0].style.fg, Some(Color::Cyan));
             assert!(l.width() <= 40);
         }
+    }
+
+    #[test]
+    fn pane_selection_strips_borders_and_clamps_to_chat() {
+        let rows = vec![
+            " ╭─ ✦ HyprPilot ".to_string(),
+            " │ Hello world".to_string(),
+            " │ Second line here".to_string(),
+            " ╰──".to_string(),
+        ];
+        let selected = extract_pane_selection(&rows, (0, 0), (3, 99));
+        assert_eq!(selected, "Hello world\nSecond line here");
+        assert!(!selected.contains("│"));
+        assert!(!selected.contains("╭"));
     }
 }
