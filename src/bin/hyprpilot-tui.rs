@@ -73,6 +73,8 @@ struct SessionSnapshot {
     keybinds: TuiKeybinds,
     #[serde(default = "default_true")]
     auto_preview_md: bool,
+    #[serde(default = "default_true")]
+    zen_mode: bool,
     #[serde(default = "default_start_mode")]
     start_mode: String,
     #[serde(default = "default_true")]
@@ -109,6 +111,7 @@ enum ClientCmd {
     UpdateKeybind { action: String, key: String },
     ResetKeybinds,
     ToggleAutoPreview,
+    ToggleZenMode,
     ToggleStartMode,
     ToggleShowTips,
     LoadConversation { id: i64 },
@@ -207,6 +210,7 @@ impl DaemonState {
             pane_ratios: self.tui_config.pane_ratios,
             keybinds: self.tui_config.keybinds.clone(),
             auto_preview_md: self.tui_config.auto_preview_md,
+            zen_mode: self.tui_config.zen_mode,
             start_mode: self.tui_config.start_mode.clone(),
             show_tips: self.tui_config.show_tips,
             active_conversation_id: self.active_conversation_id,
@@ -492,6 +496,16 @@ fn handle_daemon_cmd(
             guard.status = format!(
                 "Auto-preview MD artifacts: {}",
                 if guard.tui_config.auto_preview_md { "ON" } else { "OFF" }
+            );
+            guard.broadcast_snapshot();
+        }
+        ClientCmd::ToggleZenMode => {
+            let mut guard = state.lock().unwrap();
+            guard.tui_config.zen_mode = !guard.tui_config.zen_mode;
+            let _ = guard.tui_config.save();
+            guard.status = format!(
+                "Zen Mode (chat-only): {}",
+                if guard.tui_config.zen_mode { "ON" } else { "OFF" }
             );
             guard.broadcast_snapshot();
         }
@@ -1069,6 +1083,7 @@ struct TuiClient {
     last_left_rect: Option<Rect>,
     last_right_rect: Option<Rect>,
     rendered_transcript_lines: Vec<String>,
+    transcript_row_artifacts: Vec<Option<TuiArtifact>>,
     drag_anchor: Option<(usize, usize)>,
     drag_cursor: Option<(usize, usize)>,
     dragging: bool,
@@ -1099,6 +1114,7 @@ impl TuiClient {
             pane_ratios: [20, 60, 20],
             keybinds: TuiKeybinds::default(),
             auto_preview_md: true,
+            zen_mode: true,
             start_mode: "insert".into(),
             show_tips: true,
             active_conversation_id: None,
@@ -1142,6 +1158,7 @@ impl TuiClient {
             last_left_rect: None,
             last_right_rect: None,
             rendered_transcript_lines: Vec::new(),
+            transcript_row_artifacts: Vec::new(),
             drag_anchor: None,
             drag_cursor: None,
             dragging: false,
@@ -1341,7 +1358,7 @@ impl TuiClient {
                     if *tab == 4 {
                         if let Some(mr) = self.last_modal_rect {
                             let list_top = mr.y + 4;
-                            if me.row >= list_top && me.row < list_top + 13 {
+                            if me.row >= list_top && me.row < list_top + 14 {
                                 *selected = (me.row - list_top) as usize;
                                 self.handle_modal_key(KeyCode::Enter);
                             }
@@ -1525,6 +1542,24 @@ impl TuiClient {
                                 &format!("Copied {len} chars from chat (sidebars excluded)"),
                             );
                         }
+                    } else if let Some(Some(art)) =
+                        self.transcript_row_artifacts.get(a.0).cloned()
+                    {
+                        // Single-click on an assistant Markdown/artifact section opens it in the right sidebar preview!
+                        let title = art.title.clone();
+                        if let Some(pos) = self
+                            .preview_artifacts
+                            .iter()
+                            .position(|x| x.content == art.content)
+                        {
+                            self.preview_idx = pos;
+                        } else {
+                            self.preview_artifacts.insert(0, art);
+                            self.preview_idx = 0;
+                        }
+                        self.preview_open = true;
+                        self.preview_scroll = 0;
+                        self.local_notice = Some(format!("Previewing: {title}"));
                     }
                 }
             }
@@ -2057,6 +2092,7 @@ impl TuiClient {
             }
             KeyCode::Char('m') => self.open_model_modal(),
             KeyCode::Char('z') => self.chat_zoomed = !self.chat_zoomed,
+            KeyCode::Char('Z') => self.send_cmd(&ClientCmd::ToggleZenMode),
             KeyCode::Char('r') => self.send_cmd(&ClientCmd::FetchModels),
             KeyCode::F(2) => self.open_provider_modal(),
             KeyCode::F(3) => self.open_model_modal(),
@@ -2215,6 +2251,9 @@ impl TuiClient {
             }
             "z" | "zoom" => {
                 self.chat_zoomed = !self.chat_zoomed;
+            }
+            "zen" => {
+                self.send_cmd(&ClientCmd::ToggleZenMode);
             }
             "m" | "model" => self.open_model_modal(),
             "prov" | "provider" => self.open_provider_modal(),
@@ -2510,7 +2549,7 @@ impl TuiClient {
         } = &mut self.modal
         {
             const HELP_TABS: usize = 5;
-            const CONFIG_ITEMS: usize = 13;
+            const CONFIG_ITEMS: usize = 14;
             if *awaiting_key {
                 let new_key = match code {
                     KeyCode::Esc => {
@@ -2522,13 +2561,13 @@ impl TuiClient {
                     _ => return,
                 };
                 let action = match *selected {
-                    6 => "toggle_preview",
-                    7 => "swap_side",
-                    8 => "copy_section",
-                    9 => "search",
-                    10 => "command",
-                    11 => "focus_left",
-                    12 => "focus_right",
+                    7 => "toggle_preview",
+                    8 => "swap_side",
+                    9 => "copy_section",
+                    10 => "search",
+                    11 => "command",
+                    12 => "focus_left",
+                    13 => "focus_right",
                     _ => {
                         *awaiting_key = false;
                         return;
@@ -2594,7 +2633,8 @@ impl TuiClient {
                     self.send_cmd(&ClientCmd::ResetKeybinds);
                 }
                 KeyCode::Enter | KeyCode::Char(' ') if *tab == 4 => match *selected {
-                    0 => {
+                    0 => self.send_cmd(&ClientCmd::ToggleZenMode),
+                    1 => {
                         let presets = [[20, 60, 20], [18, 64, 18], [25, 50, 25], [15, 70, 15]];
                         let cur = self.snap.pane_ratios;
                         let next_idx = presets
@@ -2606,7 +2646,7 @@ impl TuiClient {
                             ratios: presets[next_idx],
                         });
                     }
-                    1 => {
+                    2 => {
                         let next_side = if self.snap.preview_side == "left" {
                             "right"
                         } else {
@@ -2616,11 +2656,11 @@ impl TuiClient {
                             side: next_side.to_string(),
                         });
                     }
-                    2 => self.send_cmd(&ClientCmd::ToggleAutoPreview),
-                    3 => self.send_cmd(&ClientCmd::ToggleStartMode),
-                    4 => self.send_cmd(&ClientCmd::ToggleShowTips),
-                    5 => self.send_cmd(&ClientCmd::ToggleLinuxQuick),
-                    6..=12 => {
+                    3 => self.send_cmd(&ClientCmd::ToggleAutoPreview),
+                    4 => self.send_cmd(&ClientCmd::ToggleStartMode),
+                    5 => self.send_cmd(&ClientCmd::ToggleShowTips),
+                    6 => self.send_cmd(&ClientCmd::ToggleLinuxQuick),
+                    7..=13 => {
                         *awaiting_key = true;
                     }
                     _ => {}
@@ -3033,9 +3073,9 @@ impl TuiClient {
 
     fn render(&mut self, frame: &mut ratatui::Frame<'_>) {
         let full_area = frame.area();
-        // Only enable 3-pane layout in true fullscreen/wide terminals (>= 150 cols),
-        // keeping the initial ~50% Alt+Space popup focused on Chat only (unless preview is open or forced).
-        let wide_mode = !self.chat_zoomed && self.force_panes.unwrap_or(full_area.width >= 150);
+        // Zen Mode (enabled by default) keeps only the chat window unless Preview is open or Zen is toggled off.
+        let wide_mode =
+            !self.snap.zen_mode && !self.chat_zoomed && self.force_panes.unwrap_or(full_area.width >= 150);
         let [r_left, r_center, r_right] = self.snap.pane_ratios;
 
         let (left_area, center_area, right_area): (Option<Rect>, Rect, Option<Rect>) = if self.chat_zoomed {
@@ -3234,6 +3274,7 @@ impl TuiClient {
         // Colorful Chat Transcript (pre-wrapped so prefixes & span styles never break across lines)
         let inner_width = chunks[1].width.saturating_sub(2).max(24) as usize;
         let mut lines: Vec<Line<'static>> = Vec::new();
+        self.transcript_row_artifacts.clear();
         if self.snap.messages.is_empty() && !self.snap.streaming {
             lines.push(Line::from(""));
             lines.push(Line::from(vec![
@@ -3249,8 +3290,10 @@ impl TuiClient {
                 "    Esc: Normal mode (Vim motions, / search, : commands) | p: Preview | ?: Help",
                 Style::default().fg(Color::DarkGray),
             )));
+            self.transcript_row_artifacts.resize(lines.len(), None);
         } else {
             for m in &self.snap.messages {
+                let start = lines.len();
                 render_styled_message(
                     &mut lines,
                     &m.role,
@@ -3259,8 +3302,36 @@ impl TuiClient {
                     false,
                     inner_width,
                 );
+                let added = lines.len() - start;
+                if m.role == "assistant" {
+                    let msg_slice = std::slice::from_ref(m);
+                    let arts = extract_artifacts(msg_slice);
+                    let fallback = arts.first().cloned();
+                    // Map code-bordered rows to matching fenced artifacts when present, else message Markdown
+                    let mut code_idx = 0usize;
+                    let mut in_code_box = false;
+                    for line in &lines[start..] {
+                        let plain: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                        if plain.contains("┌─") {
+                            in_code_box = true;
+                        }
+                        let art = if in_code_box {
+                            arts.get(code_idx).cloned().or_else(|| fallback.clone())
+                        } else {
+                            fallback.clone()
+                        };
+                        if plain.contains("└─") && in_code_box {
+                            in_code_box = false;
+                            code_idx += 1;
+                        }
+                        self.transcript_row_artifacts.push(art);
+                    }
+                } else {
+                    self.transcript_row_artifacts.extend(std::iter::repeat_n(None, added));
+                }
             }
             if self.snap.streaming {
+                let start = lines.len();
                 let text = if self.snap.streaming_reply.is_empty() {
                     format!("{spinner} Thinking...")
                 } else {
@@ -3274,6 +3345,8 @@ impl TuiClient {
                     true,
                     inner_width,
                 );
+                let added = lines.len() - start;
+                self.transcript_row_artifacts.extend(std::iter::repeat_n(None, added));
             }
         }
 
@@ -3518,7 +3591,15 @@ impl TuiClient {
                 if *tab == 4 {
                     let kb = &self.snap.keybinds;
                     let cfg_path = tui_config_path().display().to_string();
-                    let rows: [(&str, String); 13] = [
+                    let rows: [(&str, String); 14] = [
+                        (
+                            "Zen Mode (Chat-Only Default)",
+                            if self.snap.zen_mode {
+                                "ON  (Enter or :zen / Z to toggle)".into()
+                            } else {
+                                "OFF  (Enter or :zen / Z to toggle)".into()
+                            },
+                        ),
                         (
                             "Layout Proportions (L/C/R %)",
                             format!(

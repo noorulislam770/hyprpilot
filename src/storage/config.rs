@@ -283,6 +283,7 @@ pub fn tui_config_path() -> PathBuf {
 pub struct TuiConfig {
     pub preview_side: String,
     pub auto_preview_md: bool,
+    pub zen_mode: bool,
     pub pane_ratios: [u16; 3],
     pub start_mode: String,
     pub show_tips: bool,
@@ -294,6 +295,7 @@ impl Default for TuiConfig {
         Self {
             preview_side: "right".to_string(),
             auto_preview_md: true,
+            zen_mode: true,
             pane_ratios: [20, 60, 20],
             start_mode: "insert".to_string(),
             show_tips: true,
