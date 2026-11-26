@@ -850,6 +850,24 @@ enum VimMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MouseAction {
+    ToggleMode,
+    OpenProvider,
+    OpenModel,
+    ToggleLinux,
+    TogglePreview,
+    SwapSide,
+    OpenHistory,
+    OpenCopy,
+    OpenHelp,
+    EnterInsert,
+    EnterSearch,
+    EnterCommand,
+    CycleFocus,
+    Quit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FocusPane {
     Chat,
     History,
@@ -1054,6 +1072,16 @@ struct TuiClient {
     drag_anchor: Option<(usize, usize)>,
     drag_cursor: Option<(usize, usize)>,
     dragging: bool,
+    last_header_rect: Rect,
+    last_input_rect: Rect,
+    last_footer_rect: Rect,
+    last_specs_rect: Option<Rect>,
+    last_models_rect: Option<Rect>,
+    last_tips_rect: Option<Rect>,
+    last_modal_rect: Option<Rect>,
+    header_hitboxes: Vec<(u16, u16, MouseAction)>,
+    footer_hitboxes: Vec<(u16, u16, MouseAction)>,
+    help_tab_hitboxes: Vec<(u16, u16, u16, usize)>,
 }
 
 impl TuiClient {
@@ -1117,6 +1145,16 @@ impl TuiClient {
             drag_anchor: None,
             drag_cursor: None,
             dragging: false,
+            last_header_rect: Rect::default(),
+            last_input_rect: Rect::default(),
+            last_footer_rect: Rect::default(),
+            last_specs_rect: None,
+            last_models_rect: None,
+            last_tips_rect: None,
+            last_modal_rect: None,
+            header_hitboxes: Vec::new(),
+            footer_hitboxes: Vec::new(),
+            help_tab_hitboxes: Vec::new(),
         };
         client.send_cmd(&ClientCmd::GetState);
         Ok(client)
@@ -1212,10 +1250,163 @@ impl TuiClient {
         }
     }
 
+    fn trigger_mouse_action(&mut self, action: MouseAction) {
+        match action {
+            MouseAction::ToggleMode => {
+                self.vim_mode = if self.vim_mode == VimMode::Insert {
+                    VimMode::Normal
+                } else {
+                    VimMode::Insert
+                };
+            }
+            MouseAction::OpenProvider => self.open_provider_modal(),
+            MouseAction::OpenModel => self.open_model_modal(),
+            MouseAction::ToggleLinux => self.send_cmd(&ClientCmd::ToggleLinuxQuick),
+            MouseAction::TogglePreview => self.toggle_artifact_preview(),
+            MouseAction::SwapSide => {
+                let next_side = if self.snap.preview_side == "left" {
+                    "right"
+                } else {
+                    "left"
+                };
+                self.send_cmd(&ClientCmd::SetPreviewSide {
+                    side: next_side.to_string(),
+                });
+            }
+            MouseAction::OpenHistory => self.open_history_modal(),
+            MouseAction::OpenCopy => self.open_copy_modal(),
+            MouseAction::OpenHelp => {
+                self.modal = Modal::Help {
+                    tab: 0,
+                    selected: 0,
+                    scroll: 0,
+                    awaiting_key: false,
+                };
+            }
+            MouseAction::EnterInsert => {
+                self.focus = FocusPane::Chat;
+                self.vim_mode = VimMode::Insert;
+            }
+            MouseAction::EnterSearch => {
+                self.search_query.clear();
+                self.search_matches.clear();
+                self.vim_mode = VimMode::Search;
+            }
+            MouseAction::EnterCommand => {
+                self.command_buf.clear();
+                self.vim_mode = VimMode::Command;
+            }
+            MouseAction::CycleFocus => {
+                self.vim_mode = VimMode::Normal;
+                self.focus = match self.focus {
+                    FocusPane::History => FocusPane::Chat,
+                    FocusPane::Chat => FocusPane::Inspector,
+                    FocusPane::Inspector => FocusPane::History,
+                };
+            }
+            MouseAction::Quit => self.should_quit = true,
+        }
+    }
+
+    fn handle_modal_mouse(&mut self, me: MouseEvent) {
+        let in_rect = |r: Rect| {
+            me.column >= r.x
+                && me.column < r.x + r.width
+                && me.row >= r.y
+                && me.row < r.y + r.height
+        };
+        match me.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(mr) = self.last_modal_rect {
+                    if !in_rect(mr) {
+                        self.modal = Modal::None;
+                        return;
+                    }
+                }
+                if let Modal::Help {
+                    tab,
+                    selected,
+                    scroll,
+                    awaiting_key,
+                } = &mut self.modal
+                {
+                    for &(ty, x0, x1, tidx) in &self.help_tab_hitboxes {
+                        if me.row == ty && me.column >= x0 && me.column < x1 {
+                            *tab = tidx;
+                            *scroll = 0;
+                            *awaiting_key = false;
+                            return;
+                        }
+                    }
+                    if *tab == 4 {
+                        if let Some(mr) = self.last_modal_rect {
+                            let list_top = mr.y + 4;
+                            if me.row >= list_top && me.row < list_top + 13 {
+                                *selected = (me.row - list_top) as usize;
+                                self.handle_modal_key(KeyCode::Enter);
+                            }
+                        }
+                    }
+                    return;
+                }
+
+                // List-based modals: click directly selects & activates item
+                if let Some(mr) = self.last_modal_rect {
+                    let list_top = mr.y + 1;
+                    let list_bot = mr.y + mr.height.saturating_sub(1);
+                    if me.row >= list_top && me.row < list_bot {
+                        let rel = (me.row - list_top) as usize;
+                        match &mut self.modal {
+                            Modal::Provider(st) => {
+                                if rel < self.snap.providers.len() {
+                                    st.select(Some(rel));
+                                    self.handle_modal_key(KeyCode::Enter);
+                                }
+                            }
+                            Modal::Model(st) => {
+                                if rel < self.snap.models.len() {
+                                    st.select(Some(rel));
+                                    self.handle_modal_key(KeyCode::Enter);
+                                }
+                            }
+                            Modal::History(st) => {
+                                if rel < self.snap.history.len() {
+                                    st.select(Some(rel));
+                                    self.handle_modal_key(KeyCode::Enter);
+                                }
+                            }
+                            Modal::CopyPicker {
+                                sections,
+                                list_state,
+                                ..
+                            } => {
+                                if rel < sections.len() {
+                                    list_state.select(Some(rel));
+                                    self.handle_modal_key(KeyCode::Enter);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            MouseEventKind::ScrollUp => self.handle_modal_key(KeyCode::Up),
+            MouseEventKind::ScrollDown => self.handle_modal_key(KeyCode::Down),
+            _ => {}
+        }
+    }
+
     fn handle_mouse(&mut self, me: MouseEvent) {
         if !matches!(self.modal, Modal::None) {
+            self.handle_modal_mouse(me);
             return;
         }
+        let in_rect = |r: Rect| {
+            me.column >= r.x
+                && me.column < r.x + r.width
+                && me.row >= r.y
+                && me.row < r.y + r.height
+        };
         let tr = self.last_transcript_rect;
         let inner_x_min = tr.x.saturating_add(1);
         let inner_x_max = tr.x.saturating_add(tr.width.saturating_sub(2)).max(inner_x_min);
@@ -1230,24 +1421,95 @@ impl TuiClient {
 
         match me.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                if me.column >= tr.x
-                    && me.column < tr.x + tr.width
-                    && me.row >= tr.y
-                    && me.row < tr.y + tr.height
-                {
+                self.drag_anchor = None;
+                self.drag_cursor = None;
+                self.dragging = false;
+
+                // 1. Center Transcript: start pane-clamped drag selection
+                if in_rect(tr) {
                     let pos = clamp_to_transcript(me.column, me.row);
                     self.drag_anchor = Some(pos);
                     self.drag_cursor = Some(pos);
                     self.dragging = true;
                     self.focus = FocusPane::Chat;
-                } else {
-                    self.drag_anchor = None;
-                    self.drag_cursor = None;
-                    self.dragging = false;
+                    return;
+                }
+
+                // 2. Top Header Pills
+                if in_rect(self.last_header_rect) {
+                    for &(x0, x1, act) in &self.header_hitboxes.clone() {
+                        if me.column >= x0 && me.column < x1 {
+                            self.trigger_mouse_action(act);
+                            return;
+                        }
+                    }
+                    return;
+                }
+
+                // 3. Input Box: focus & enter Insert mode
+                if in_rect(self.last_input_rect) {
+                    self.focus = FocusPane::Chat;
+                    self.vim_mode = VimMode::Insert;
+                    return;
+                }
+
+                // 4. Bottom Shortcut Footer chips
+                if in_rect(self.last_footer_rect) {
+                    for &(x0, x1, act) in &self.footer_hitboxes.clone() {
+                        if me.column >= x0 && me.column < x1 {
+                            self.trigger_mouse_action(act);
+                            return;
+                        }
+                    }
+                    return;
+                }
+
+                // 5. Left Sidebar: Recent Chats (click row to load)
+                if let Some(lr) = self.last_left_rect {
+                    if in_rect(lr) && !(self.preview_open && self.snap.preview_side == "left") {
+                        self.focus = FocusPane::History;
+                        self.vim_mode = VimMode::Normal;
+                        if me.row > lr.y && me.row + 1 < lr.y + lr.height {
+                            let idx = ((me.row - lr.y - 1) / 2) as usize;
+                            if let Some(conv) = self.snap.history.get(idx) {
+                                let id = conv.id;
+                                self.history_state.select(Some(idx));
+                                self.auto_scroll = true;
+                                self.send_cmd(&ClientCmd::LoadConversation { id });
+                            }
+                        }
+                        return;
+                    }
+                }
+
+                // 6. Right Inspector: Quick Model Switcher, Specs, or Tips
+                if let Some(mr) = self.last_models_rect {
+                    if in_rect(mr) {
+                        self.focus = FocusPane::Inspector;
+                        self.vim_mode = VimMode::Normal;
+                        if me.row > mr.y && me.row + 1 < mr.y + mr.height {
+                            let idx = (me.row - mr.y - 1) as usize;
+                            if let Some(model) = self.snap.models.get(idx).cloned() {
+                                self.inspector_model_state.select(Some(idx));
+                                self.send_cmd(&ClientCmd::SelectModel { model });
+                            }
+                        }
+                        return;
+                    }
+                }
+                if let Some(tr_tips) = self.last_tips_rect {
+                    if in_rect(tr_tips) {
+                        self.trigger_mouse_action(MouseAction::OpenHelp);
+                        return;
+                    }
+                }
+                if let Some(sr) = self.last_specs_rect {
+                    if in_rect(sr) {
+                        self.open_provider_modal();
+                    }
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) if self.dragging => {
-                // Strictly clamped to the center transcript pane — never bleeds into sidebars!
                 self.drag_cursor = Some(clamp_to_transcript(me.column, me.row));
             }
             MouseEventKind::Up(MouseButton::Left) if self.dragging => {
@@ -1267,12 +1529,33 @@ impl TuiClient {
                 }
             }
             MouseEventKind::ScrollUp => {
+                if let Some(lr) = self.last_left_rect {
+                    if in_rect(lr) {
+                        if self.preview_open && self.snap.preview_side == "left" {
+                            self.preview_scroll = self.preview_scroll.saturating_sub(3);
+                        } else if !self.snap.history.is_empty() {
+                            let next = self
+                                .history_state
+                                .selected()
+                                .map(|i| i.saturating_sub(1))
+                                .unwrap_or(0);
+                            self.history_state.select(Some(next));
+                        }
+                        return;
+                    }
+                }
                 if let Some(rr) = self.last_right_rect {
-                    if self.preview_open
-                        && me.column >= rr.x
-                        && me.column < rr.x + rr.width
-                    {
-                        self.preview_scroll = self.preview_scroll.saturating_sub(3);
+                    if in_rect(rr) {
+                        if self.preview_open && self.snap.preview_side != "left" {
+                            self.preview_scroll = self.preview_scroll.saturating_sub(3);
+                        } else if !self.snap.models.is_empty() {
+                            let next = self
+                                .inspector_model_state
+                                .selected()
+                                .map(|i| i.saturating_sub(1))
+                                .unwrap_or(0);
+                            self.inspector_model_state.select(Some(next));
+                        }
                         return;
                     }
                 }
@@ -1280,12 +1563,33 @@ impl TuiClient {
                 self.scroll_offset = self.scroll_offset.saturating_sub(3);
             }
             MouseEventKind::ScrollDown => {
+                if let Some(lr) = self.last_left_rect {
+                    if in_rect(lr) {
+                        if self.preview_open && self.snap.preview_side == "left" {
+                            self.preview_scroll = self.preview_scroll.saturating_add(3);
+                        } else if !self.snap.history.is_empty() {
+                            let next = self
+                                .history_state
+                                .selected()
+                                .map(|i| (i + 1).min(self.snap.history.len() - 1))
+                                .unwrap_or(0);
+                            self.history_state.select(Some(next));
+                        }
+                        return;
+                    }
+                }
                 if let Some(rr) = self.last_right_rect {
-                    if self.preview_open
-                        && me.column >= rr.x
-                        && me.column < rr.x + rr.width
-                    {
-                        self.preview_scroll = self.preview_scroll.saturating_add(3);
+                    if in_rect(rr) {
+                        if self.preview_open && self.snap.preview_side != "left" {
+                            self.preview_scroll = self.preview_scroll.saturating_add(3);
+                        } else if !self.snap.models.is_empty() {
+                            let next = self
+                                .inspector_model_state
+                                .selected()
+                                .map(|i| (i + 1).min(self.snap.models.len() - 1))
+                                .unwrap_or(0);
+                            self.inspector_model_state.select(Some(next));
+                        }
                         return;
                     }
                 }
@@ -2618,6 +2922,9 @@ impl TuiClient {
                             .add_modifier(Modifier::BOLD),
                     )),
             );
+        self.last_specs_rect = Some(sections[0]);
+        self.last_models_rect = Some(sections[1]);
+        self.last_tips_rect = Some(sections[2]);
         frame.render_widget(specs_box, sections[0]);
 
         let model_items: Vec<ListItem<'_>> = if self.snap.models.is_empty() {
@@ -2763,6 +3070,13 @@ impl TuiClient {
 
         self.last_left_rect = left_area;
         self.last_right_rect = right_area;
+        self.last_specs_rect = None;
+        self.last_models_rect = None;
+        self.last_tips_rect = None;
+        self.last_modal_rect = None;
+        self.header_hitboxes.clear();
+        self.footer_hitboxes.clear();
+        self.help_tab_hitboxes.clear();
 
         if let Some(la) = left_area {
             if self.preview_open && self.snap.preview_side == "left" {
@@ -2852,6 +3166,33 @@ impl TuiClient {
             Span::styled(format!(" {msg} "), Style::default().fg(Color::Gray))
         };
 
+        let prov_text = format!(" {} ", self.snap.provider_name);
+        let model_text = format!(" {} ", self.snap.model);
+        let linux_text = if self.snap.linux_quick_mode {
+            " Linux:ON "
+        } else {
+            " Linux:OFF "
+        };
+        let mode_text = match self.vim_mode {
+            VimMode::Insert => " INSERT ",
+            VimMode::Normal => " NORMAL ",
+            VimMode::Search => " SEARCH ",
+            VimMode::Command => " CMD ",
+        };
+        let mut hx = chunks[0].x + 1;
+        let mw = mode_text.chars().count() as u16;
+        self.header_hitboxes.push((hx, hx + mw, MouseAction::ToggleMode));
+        hx += mw + 1 + " ✦ HyprPilot ".chars().count() as u16 + 1;
+        let pw = prov_text.chars().count() as u16;
+        self.header_hitboxes.push((hx, hx + pw, MouseAction::OpenProvider));
+        hx += pw + 1;
+        let mdw = model_text.chars().count() as u16;
+        self.header_hitboxes.push((hx, hx + mdw, MouseAction::OpenModel));
+        hx += mdw + 1;
+        let lw = linux_text.chars().count() as u16;
+        self.header_hitboxes.push((hx, hx + lw, MouseAction::ToggleLinux));
+        self.last_header_rect = chunks[0];
+
         let header = Paragraph::new(Line::from(vec![
             mode_badge,
             Span::raw(" "),
@@ -2864,7 +3205,7 @@ impl TuiClient {
             ),
             Span::raw(" "),
             Span::styled(
-                format!(" {} ", self.snap.provider_name),
+                prov_text,
                 Style::default()
                     .bg(Color::Rgb(24, 78, 120))
                     .fg(Color::LightCyan)
@@ -2872,7 +3213,7 @@ impl TuiClient {
             ),
             Span::raw(" "),
             Span::styled(
-                format!(" {} ", self.snap.model),
+                model_text,
                 Style::default()
                     .bg(Color::Rgb(95, 68, 22))
                     .fg(Color::LightYellow)
@@ -3042,9 +3383,23 @@ impl TuiClient {
                     Style::default().fg(Color::LightBlue),
                 )),
         );
+        self.last_input_rect = chunks[2];
         frame.render_widget(input_box, chunks[2]);
 
-        // Bottom Bar: Vim Search / Command prompt or contextual shortcut chips
+        // Bottom Bar: Vim Search / Command prompt or clickable shortcut chips
+        self.last_footer_rect = chunks[3];
+        let mut fx = chunks[3].x;
+        let mut build_chips = |defs: &[(&str, &str, MouseAction)]| -> Vec<Span<'static>> {
+            let mut spans = Vec::with_capacity(defs.len());
+            for &(k, l, act) in defs {
+                let txt = format!(" {k}:{l} ");
+                let w = txt.chars().count() as u16;
+                self.footer_hitboxes.push((fx, fx + w, act));
+                fx += w;
+                spans.push(key_chip(k, l));
+            }
+            spans
+        };
         let footer = match self.vim_mode {
             VimMode::Search => Paragraph::new(Line::from(vec![
                 Span::styled(
@@ -3070,26 +3425,27 @@ impl TuiClient {
                 Span::styled(self.command_buf.clone(), Style::default().fg(Color::White)),
                 Span::styled("█", Style::default().fg(Color::LightMagenta)),
             ])),
-            VimMode::Normal => Paragraph::new(Line::from(vec![
-                key_chip("i", "Insert"),
-                key_chip("/", "Search"),
-                key_chip(":", "Cmd"),
-                key_chip("p", "Preview"),
-                key_chip("s", "Side"),
-                key_chip("y", "Copy"),
-                key_chip("Ctrl+W", "Pane"),
-                key_chip("?", "Help"),
-                key_chip("q", "Hide"),
-            ])),
-            VimMode::Insert => Paragraph::new(Line::from(vec![
-                key_chip("Esc", "Normal"),
-                key_chip("Ctrl+P", "Provider"),
-                key_chip("Ctrl+M", "Model"),
-                key_chip("Ctrl+E", "Preview"),
-                key_chip("Ctrl+G", "History"),
-                key_chip("Ctrl+Y", "Copy"),
-                key_chip("Ctrl+Q", "Quit"),
-            ])),
+            VimMode::Normal => Paragraph::new(Line::from(build_chips(&[
+                ("i", "Insert", MouseAction::EnterInsert),
+                ("/", "Search", MouseAction::EnterSearch),
+                (":", "Cmd", MouseAction::EnterCommand),
+                ("p", "Preview", MouseAction::TogglePreview),
+                ("s", "Side", MouseAction::SwapSide),
+                ("y", "Copy", MouseAction::OpenCopy),
+                ("Ctrl+W", "Pane", MouseAction::CycleFocus),
+                ("?", "Help", MouseAction::OpenHelp),
+                ("q", "Hide", MouseAction::Quit),
+            ]))),
+            VimMode::Insert => Paragraph::new(Line::from(build_chips(&[
+                ("Esc", "Normal", MouseAction::ToggleMode),
+                ("Ctrl+P", "Provider", MouseAction::OpenProvider),
+                ("Ctrl+M", "Model", MouseAction::OpenModel),
+                ("Ctrl+E", "Preview", MouseAction::TogglePreview),
+                ("Ctrl+G", "History", MouseAction::OpenHistory),
+                ("Ctrl+Y", "Copy", MouseAction::OpenCopy),
+                ("?", "Help", MouseAction::OpenHelp),
+                ("Ctrl+Q", "Quit", MouseAction::Quit),
+            ]))),
         };
         frame.render_widget(footer, chunks[3]);
 
@@ -3103,6 +3459,7 @@ impl TuiClient {
                 awaiting_key,
             } => {
                 let area = centered_rect(88, 86, frame.area());
+                self.last_modal_rect = Some(area);
                 frame.render_widget(Clear, area);
                 let parts = Layout::default()
                     .direction(Direction::Vertical)
@@ -3121,10 +3478,16 @@ impl TuiClient {
                     "5:TUI Config (tui.toml)",
                 ];
                 let mut tab_spans = vec![Span::raw(" ")];
+                let mut tx = parts[0].x + 2;
+                let ty = parts[0].y + 1;
                 for (i, name) in tab_names.iter().enumerate() {
+                    let label = format!(" {name} ");
+                    let tw = label.chars().count() as u16;
+                    self.help_tab_hitboxes.push((ty, tx, tx + tw, i));
+                    tx += tw + 1;
                     if i == *tab {
                         tab_spans.push(Span::styled(
-                            format!(" {name} "),
+                            label,
                             Style::default()
                                 .bg(Color::Rgb(35, 90, 155))
                                 .fg(Color::White)
@@ -3132,7 +3495,7 @@ impl TuiClient {
                         ));
                     } else {
                         tab_spans.push(Span::styled(
-                            format!(" {name} "),
+                            label,
                             Style::default().fg(Color::Gray),
                         ));
                     }
@@ -3339,6 +3702,7 @@ impl TuiClient {
                 frame.render_widget(help_footer, parts[2]);
             }
             Modal::Provider(st) => {
+                self.last_modal_rect = Some(centered_rect(72, 65, frame.area()));
                 let items: Vec<ListItem<'_>> = self
                     .snap
                     .providers
@@ -3354,6 +3718,7 @@ impl TuiClient {
                 render_modal_list(frame, " Select Provider (Enter / Esc) ", items, st);
             }
             Modal::Model(st) => {
+                self.last_modal_rect = Some(centered_rect(72, 65, frame.area()));
                 let items: Vec<ListItem<'_>> = self
                     .snap
                     .models
@@ -3374,6 +3739,7 @@ impl TuiClient {
                 render_modal_list(frame, " Select Model (Enter / Esc) ", items, st);
             }
             Modal::History(st) => {
+                self.last_modal_rect = Some(centered_rect(72, 65, frame.area()));
                 let items: Vec<ListItem<'_>> = self
                     .snap
                     .history
@@ -3466,6 +3832,7 @@ impl TuiClient {
                 ..
             } => {
                 let area = centered_rect(88, 80, frame.area());
+                self.last_modal_rect = Some(area);
                 frame.render_widget(Clear, area);
                 let parts = Layout::default()
                     .direction(Direction::Vertical)
