@@ -22,7 +22,8 @@ pub async fn stream(
     }
 
     let base = provider.base_url.trim_end_matches('/');
-    let url = format!("{base}/models/{}:streamGenerateContent?alt=sse", provider.model);
+    let model = provider.model.trim().trim_start_matches("models/");
+    let url = format!("{base}/models/{model}:streamGenerateContent?alt=sse");
 
     let contents: Vec<Value> = messages
         .iter()

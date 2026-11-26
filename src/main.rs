@@ -1,9 +1,11 @@
 use anyhow::Result;
 use gtk4::prelude::*;
 use libadwaita as adw;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 use hyprpilot::APP_ID;
-use hyprpilot::hyprland::{hide_window, sync_hyprland_config, toggle_or_launch};
+use hyprpilot::hyprland::{hide_window, send_ipc_command, sync_hyprland_config, toggle_or_launch};
 use hyprpilot::storage::config::AppConfig;
 use hyprpilot::ui::{load_css, window::build_main_window};
 
@@ -18,14 +20,19 @@ fn main() -> Result<()> {
         }
         Some("--toggle") => return toggle_or_launch(),
         Some("--hide") => return hide_window(),
+        Some("--quit") => {
+            let _ = send_ipc_command("QUIT");
+            return Ok(());
+        }
         Some("--help") | Some("-h") => {
             println!(
                 "HyprPilot — Lightweight Copilot-style AI Assistant for Arch & Hyprland\n\n\
                  USAGE:\n  \
-                   hyprpilot                     Launch or focus the GUI window\n  \
+                   hyprpilot                     Launch or show the GUI window\n  \
                    hyprpilot-toggle              Toggle show/hide on Hyprland (bind to hotkey)\n  \
                    hyprpilot --install-hyprland  Write ~/.config/hypr/hyprpilot.lua & .conf and reload\n  \
-                   hyprpilot --hide              Hide window to special:hyprpilot"
+                   hyprpilot --hide              Hide window to background\n  \
+                   hyprpilot --quit              Exit the background HyprPilot process"
             );
             return Ok(());
         }
@@ -33,17 +40,24 @@ fn main() -> Result<()> {
     }
 
     let app = adw::Application::builder().application_id(APP_ID).build();
+    let hold_guard: Rc<RefCell<Option<gtk4::gio::ApplicationHoldGuard>>> =
+        Rc::new(RefCell::new(None));
+    let win_slot: Rc<RefCell<Option<adw::ApplicationWindow>>> = Rc::new(RefCell::new(None));
 
-    app.connect_startup(|_| {
+    let hold_startup = hold_guard.clone();
+    app.connect_startup(move |app| {
+        *hold_startup.borrow_mut() = Some(app.hold());
         load_css();
     });
 
-    app.connect_activate(|app| {
-        if let Some(existing) = app.active_window() {
-            existing.present();
+    app.connect_activate(move |app| {
+        if let Some(win) = win_slot.borrow().as_ref() {
+            win.set_visible(true);
+            win.present();
             return;
         }
         let win = build_main_window(app);
+        *win_slot.borrow_mut() = Some(win.clone());
         win.present();
     });
 

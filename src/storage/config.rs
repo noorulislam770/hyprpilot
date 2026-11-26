@@ -110,7 +110,7 @@ pub fn default_providers() -> Vec<ProviderProfile> {
             kind: ProviderKind::Gemini,
             auth_mode: AuthMode::ApiKey,
             base_url: "https://generativelanguage.googleapis.com/v1beta".into(),
-            model: "gemini-2.5-flash".into(),
+            model: "gemini-3.8-flash".into(),
             token: String::new(),
             extra_headers: BTreeMap::new(),
         },
@@ -215,6 +215,12 @@ pub fn state_dir() -> PathBuf {
         .join("hyprpilot")
 }
 
+pub fn socket_path() -> PathBuf {
+    dirs::runtime_dir()
+        .unwrap_or_else(state_dir)
+        .join("hyprpilot.sock")
+}
+
 pub fn config_path() -> PathBuf {
     config_dir().join("config.toml")
 }
@@ -239,6 +245,21 @@ impl AppConfig {
         }
         if cfg.toggle_hotkey.trim().is_empty() {
             cfg.toggle_hotkey = DEFAULT_TOGGLE_HOTKEY.to_string();
+        }
+        let mut migrated = false;
+        for p in &mut cfg.providers {
+            if p.kind == ProviderKind::Gemini
+                && matches!(
+                    p.model.trim(),
+                    "gemini-2.5-flash" | "models/gemini-2.5-flash" | "gemini-2.0-flash"
+                )
+            {
+                p.model = "gemini-3.8-flash".to_string();
+                migrated = true;
+            }
+        }
+        if migrated {
+            let _ = cfg.save();
         }
         Ok(cfg)
     }

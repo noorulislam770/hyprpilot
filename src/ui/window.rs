@@ -3,14 +3,18 @@ use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
 use std::cell::RefCell;
+use std::fs;
+use std::io::{BufRead, BufReader};
+use std::os::unix::net::UnixListener;
 use std::rc::Rc;
+use tokio::sync::mpsc;
 
 use super::native_chat::NativeChatPane;
 use super::settings::show_settings_dialog;
 use super::web_portal::WebPortalPane;
 use crate::APP_NAME;
-use crate::hyprland::hide_window;
-use crate::storage::config::AppConfig;
+use crate::hyprland::snapshot_and_save_geometry;
+use crate::storage::config::{AppConfig, socket_path};
 
 pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
     let config = Rc::new(RefCell::new(AppConfig::load().unwrap_or_default()));
@@ -26,6 +30,7 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
         .title(APP_NAME)
         .default_width(920)
         .default_height(620)
+        .hide_on_close(true)
         .build();
     window.add_css_class("hyprpilot-window");
 
@@ -54,7 +59,10 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
     fs_btn.set_tooltip_text(Some("Toggle Fullscreen (F11)"));
 
     let hide_btn = gtk4::Button::from_icon_name("window-minimize-symbolic");
-    hide_btn.set_tooltip_text(Some("Hide (Esc or Toggle Hotkey)"));
+    hide_btn.set_tooltip_text(Some("Hide to Background (Esc or Toggle Hotkey)"));
+
+    let quit_btn = gtk4::Button::from_icon_name("application-exit-symbolic");
+    quit_btn.set_tooltip_text(Some("Quit HyprPilot Completely (Ctrl+Q)"));
 
     let settings_btn = gtk4::Button::from_icon_name("emblem-system-symbolic");
     settings_btn.set_tooltip_text(Some("Settings (Ctrl+,)"));
@@ -62,6 +70,7 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
     let header = adw::HeaderBar::new();
     header.set_title_widget(Some(&switcher));
     header.pack_start(&settings_btn);
+    header.pack_end(&quit_btn);
     header.pack_end(&hide_btn);
     header.pack_end(&fs_btn);
 
@@ -70,7 +79,18 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
     toolbar_view.set_content(Some(&view_stack));
     window.set_content(Some(&toolbar_view));
 
-    // Lazy-load WebKit only when the user actually switches to Web Portals
+    start_ipc_server(window.clone(), app.clone());
+
+    // Clicking window close button hides to background rather than exiting
+    {
+        let win = window.clone();
+        window.connect_close_request(move |_| {
+            hide_to_background(&win);
+            gtk4::glib::Propagation::Stop
+        });
+    }
+
+    // Lazy-load WebKit only when the user switches to Web Portals
     {
         let pp = portal_pane.clone();
         let np = native_pane.clone();
@@ -90,11 +110,18 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
     }
 
     // Hide button
-    hide_btn.connect_clicked(|_| {
-        let _ = hide_window();
-    });
+    {
+        let win = window.clone();
+        hide_btn.connect_clicked(move |_| hide_to_background(&win));
+    }
 
-    // Settings dialog
+    // Quit button
+    {
+        let app_ref = app.clone();
+        quit_btn.connect_clicked(move |_| quit_app(&app_ref));
+    }
+
+    // Settings window (separate modal window)
     {
         let win = window.clone();
         let cfg = config.clone();
@@ -110,11 +137,12 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
         });
     }
 
-    // Global keyboard shortcuts
+    // Keyboard shortcuts (Bubble phase so modal dialogs & popovers handle Esc first)
     let key_ctrl = gtk4::EventControllerKey::new();
-    key_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    key_ctrl.set_propagation_phase(gtk4::PropagationPhase::Bubble);
     {
         let win = window.clone();
+        let app_ref = app.clone();
         let vs = view_stack.clone();
         let np = native_pane.clone();
         let pp = portal_pane.clone();
@@ -125,7 +153,7 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
                 return gtk4::glib::Propagation::Stop;
             }
             if key == gdk::Key::Escape && cfg.borrow().hide_on_escape {
-                let _ = hide_window();
+                hide_to_background(&win);
                 return gtk4::glib::Propagation::Stop;
             }
             if mods.contains(gdk::ModifierType::CONTROL_MASK) {
@@ -141,6 +169,10 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
                     gdk::Key::n | gdk::Key::N => {
                         vs.set_visible_child_name("native");
                         np.new_chat();
+                        return gtk4::glib::Propagation::Stop;
+                    }
+                    gdk::Key::q | gdk::Key::Q => {
+                        quit_app(&app_ref);
                         return gtk4::glib::Propagation::Stop;
                     }
                     gdk::Key::comma => {
@@ -173,6 +205,68 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
 
     native_pane.focus_input();
     window
+}
+
+fn hide_to_background(win: &adw::ApplicationWindow) {
+    let _ = snapshot_and_save_geometry();
+    if win.is_fullscreen() {
+        win.unfullscreen();
+    }
+    win.set_visible(false);
+}
+
+fn quit_app(app: &adw::Application) {
+    let _ = fs::remove_file(socket_path());
+    app.quit();
+}
+
+fn start_ipc_server(win: adw::ApplicationWindow, app: adw::Application) {
+    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    let sock = socket_path();
+    if let Some(parent) = sock.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::remove_file(&sock);
+
+    std::thread::spawn(move || {
+        let Ok(listener) = UnixListener::bind(&sock) else {
+            return;
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&sock, fs::Permissions::from_mode(0o600));
+        }
+        for stream in listener.incoming().flatten() {
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            if reader.read_line(&mut line).is_ok() {
+                let cmd = line.trim().to_uppercase();
+                if !cmd.is_empty() {
+                    let _ = tx.send(cmd);
+                }
+            }
+        }
+    });
+
+    gtk4::glib::MainContext::default().spawn_local(async move {
+        while let Some(cmd) = rx.recv().await {
+            match cmd.as_str() {
+                "SHOW" => {
+                    win.set_visible(true);
+                    win.present();
+                }
+                "HIDE" => {
+                    hide_to_background(&win);
+                }
+                "QUIT" => {
+                    quit_app(&app);
+                    break;
+                }
+                _ => {}
+            }
+        }
+    });
 }
 
 fn toggle_fullscreen(win: &adw::ApplicationWindow) {

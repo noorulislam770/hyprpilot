@@ -15,28 +15,60 @@ pub fn show_settings_dialog<F>(
 ) where
     F: Fn(&AppConfig) + 'static,
 {
-    let dialog = adw::PreferencesDialog::new();
-    dialog.set_title("HyprPilot Settings");
-    dialog.set_content_width(640);
-    dialog.set_content_height(580);
+    let settings_win = adw::Window::builder()
+        .title("HyprPilot Settings")
+        .transient_for(parent)
+        .modal(true)
+        .default_width(660)
+        .default_height(600)
+        .build();
 
+    let view_stack = adw::ViewStack::new();
     let general_page = build_general_page(config.clone());
     let providers_page = build_providers_page(config.clone());
     let portals_page = build_portals_page(config.clone());
 
-    dialog.add(&general_page);
-    dialog.add(&providers_page);
-    dialog.add(&portals_page);
+    let p1 = view_stack.add_titled(&general_page, Some("general"), "General & Hyprland");
+    p1.set_icon_name(Some("preferences-system-symbolic"));
+    let p2 = view_stack.add_titled(&providers_page, Some("providers"), "Native AI & Tokens");
+    p2.set_icon_name(Some("network-server-symbolic"));
+    let p3 = view_stack.add_titled(&portals_page, Some("portals"), "Web Portals");
+    p3.set_icon_name(Some("web-browser-symbolic"));
+
+    let switcher = adw::ViewSwitcher::new();
+    switcher.set_stack(Some(&view_stack));
+    switcher.set_policy(adw::ViewSwitcherPolicy::Wide);
+
+    let header = adw::HeaderBar::new();
+    header.set_title_widget(Some(&switcher));
+
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&header);
+    toolbar.set_content(Some(&view_stack));
+    settings_win.set_content(Some(&toolbar));
+
+    let key_ctrl = gtk4::EventControllerKey::new();
+    key_ctrl.set_propagation_phase(gtk4::PropagationPhase::Bubble);
+    let win_esc = settings_win.clone();
+    key_ctrl.connect_key_pressed(move |_, key, _, _| {
+        if key == gtk4::gdk::Key::Escape {
+            win_esc.close();
+            return gtk4::glib::Propagation::Stop;
+        }
+        gtk4::glib::Propagation::Proceed
+    });
+    settings_win.add_controller(key_ctrl);
 
     let on_saved = Rc::new(on_saved);
     let cfg_close = config.clone();
-    dialog.connect_closed(move |_| {
+    settings_win.connect_close_request(move |_| {
         let cfg = cfg_close.borrow().clone();
         let _ = cfg.save();
         on_saved(&cfg);
+        gtk4::glib::Propagation::Proceed
     });
 
-    dialog.present(Some(parent));
+    settings_win.present();
 }
 
 fn build_general_page(config: Rc<RefCell<AppConfig>>) -> adw::PreferencesPage {
@@ -126,7 +158,7 @@ fn build_general_page(config: Rc<RefCell<AppConfig>>) -> adw::PreferencesPage {
 
     let esc_row = adw::SwitchRow::new();
     esc_row.set_title("Hide on Escape");
-    esc_row.set_subtitle("Pressing Esc hides HyprPilot back to the special workspace");
+    esc_row.set_subtitle("Pressing Esc hides HyprPilot to the background");
     esc_row.set_active(config.borrow().hide_on_escape);
     let cfg_e = config.clone();
     esc_row.connect_active_notify(move |r| {

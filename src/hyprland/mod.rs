@@ -1,13 +1,15 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::Write;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-use crate::storage::config::{AppConfig, format_hyprland_hotkey, state_dir};
-use crate::{APP_ID, SPECIAL_WORKSPACE};
+use crate::APP_ID;
+use crate::storage::config::{AppConfig, format_hyprland_hotkey, socket_path, state_dir};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SavedGeometry {
@@ -30,19 +32,13 @@ struct HyprClient {
     size: [i32; 2],
     #[serde(default)]
     fullscreen: i32,
+    #[allow(dead_code)]
     workspace: HyprWorkspaceRef,
 }
 
 #[derive(Debug, Deserialize)]
 struct HyprWorkspaceRef {
     #[allow(dead_code)]
-    #[serde(default)]
-    id: i64,
-    name: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct HyprActiveWorkspace {
     #[serde(default)]
     id: i64,
     #[allow(dead_code)]
@@ -92,25 +88,6 @@ fn is_lua_config() -> bool {
     hypr_config_dir().join("hyprland.lua").exists()
 }
 
-fn dispatch_move_workspace(address: &str, workspace: &str, silent: bool) -> Result<()> {
-    if is_lua_config() {
-        let silent_arg = if silent { ", silent = true" } else { "" };
-        let cmd = format!(
-            "hl.dsp.window.move({{ workspace = \"{workspace}\"{silent_arg}, window = \"address:{address}\" }})"
-        );
-        run_hyprctl(&["dispatch", &cmd])?;
-    } else {
-        let dispatcher = if silent {
-            "movetoworkspacesilent"
-        } else {
-            "movetoworkspace"
-        };
-        let arg = format!("{workspace},address:{address}");
-        run_hyprctl(&["dispatch", dispatcher, &arg])?;
-    }
-    Ok(())
-}
-
 fn dispatch_focus_address(address: &str) {
     if is_lua_config() {
         let cmd = format!("hl.dsp.focus({{ window = \"address:{address}\" }})");
@@ -138,12 +115,6 @@ fn find_hyprpilot_client() -> Result<Option<HyprClient>> {
     Ok(clients
         .into_iter()
         .find(|c| c.class == APP_ID || c.initial_class == APP_ID))
-}
-
-fn active_workspace_id() -> Result<i64> {
-    let raw = run_hyprctl(&["-j", "activeworkspace"])?;
-    let ws: HyprActiveWorkspace = serde_json::from_str(&raw)?;
-    Ok(ws.id)
 }
 
 fn apply_geometry_to_address(address: &str, geom: &SavedGeometry) {
@@ -184,67 +155,70 @@ fn snapshot_client_geometry(client: &HyprClient) -> SavedGeometry {
     }
 }
 
-pub fn hide_window() -> Result<()> {
-    let Some(client) = find_hyprpilot_client()? else {
-        return Ok(());
+pub fn send_ipc_command(cmd: &str) -> bool {
+    let path = socket_path();
+    let Ok(mut stream) = UnixStream::connect(&path) else {
+        return false;
     };
-    if client.workspace.name == SPECIAL_WORKSPACE {
+    let line = format!("{cmd}\n");
+    stream.write_all(line.as_bytes()).is_ok()
+}
+
+pub fn snapshot_and_save_geometry() -> Result<Option<HyprClientSnapshot>> {
+    let Some(client) = find_hyprpilot_client()? else {
+        return Ok(None);
+    };
+    let geom = snapshot_client_geometry(&client);
+    save_geometry(&geom)?;
+    Ok(Some(HyprClientSnapshot {
+        address: client.address,
+        fullscreen: client.fullscreen > 0,
+    }))
+}
+
+pub struct HyprClientSnapshot {
+    pub address: String,
+    pub fullscreen: bool,
+}
+
+pub fn hide_window() -> Result<()> {
+    let _ = snapshot_and_save_geometry();
+    if send_ipc_command("HIDE") {
         return Ok(());
     }
-    let geom = snapshot_client_geometry(&client);
-    let _ = save_geometry(&geom);
-
-    if client.fullscreen > 0 {
-        dispatch_focus_address(&client.address);
-        dispatch_toggle_fullscreen();
-    }
-    dispatch_move_workspace(&client.address, SPECIAL_WORKSPACE, true)?;
     Ok(())
 }
 
-fn show_window(client: &HyprClient) -> Result<()> {
-    let ws_id = active_workspace_id()?.to_string();
-    dispatch_move_workspace(&client.address, &ws_id, false)?;
-
+pub fn restore_geometry_when_mapped() {
     let saved = load_geometry();
-    if let Some(ref geom) = saved {
-        apply_geometry_to_address(&client.address, geom);
+    for _ in 0..80 {
+        if let Ok(Some(client)) = find_hyprpilot_client() {
+            if let Some(ref geom) = saved {
+                apply_geometry_to_address(&client.address, geom);
+            }
+            dispatch_focus_address(&client.address);
+            if saved.as_ref().is_some_and(|g| g.fullscreen) && client.fullscreen == 0 {
+                dispatch_toggle_fullscreen();
+            }
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
     }
-
-    dispatch_focus_address(&client.address);
-
-    if saved.as_ref().is_some_and(|g| g.fullscreen) && client.fullscreen == 0 {
-        dispatch_toggle_fullscreen();
-    }
-    Ok(())
 }
 
 pub fn toggle_or_launch() -> Result<()> {
-    if let Some(client) = find_hyprpilot_client()? {
-        if client.workspace.name == SPECIAL_WORKSPACE {
-            show_window(&client)?;
-        } else {
-            hide_window()?;
-        }
-        return Ok(());
-    }
-
-    launch_hyprpilot_detached()?;
-
-    // If the user has saved window geometry from an earlier session, restore it once mapped.
-    if let Some(geom) = load_geometry() {
-        for _ in 0..40 {
-            thread::sleep(Duration::from_millis(50));
-            if let Ok(Some(client)) = find_hyprpilot_client() {
-                apply_geometry_to_address(&client.address, &geom);
-                dispatch_focus_address(&client.address);
-                if geom.fullscreen {
-                    dispatch_toggle_fullscreen();
-                }
-                break;
-            }
+    if find_hyprpilot_client()?.is_some() {
+        let _ = snapshot_and_save_geometry();
+        if send_ipc_command("HIDE") {
+            return Ok(());
         }
     }
+
+    if !send_ipc_command("SHOW") {
+        launch_hyprpilot_detached()?;
+    }
+
+    restore_geometry_when_mapped();
     Ok(())
 }
 
