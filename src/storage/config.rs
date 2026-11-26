@@ -55,6 +55,36 @@ pub struct PortalEntry {
     pub url: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct TuiKeybinds {
+    pub toggle_preview: String,
+    pub swap_side: String,
+    pub copy_section: String,
+    pub search: String,
+    pub command: String,
+    pub help: String,
+    pub focus_left: String,
+    pub focus_right: String,
+    pub new_chat: String,
+}
+
+impl Default for TuiKeybinds {
+    fn default() -> Self {
+        Self {
+            toggle_preview: "p".into(),
+            swap_side: "s".into(),
+            copy_section: "y".into(),
+            search: "/".into(),
+            command: ":".into(),
+            help: "?".into(),
+            focus_left: "h".into(),
+            focus_right: "l".into(),
+            new_chat: "Ctrl+n".into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
@@ -67,6 +97,8 @@ pub struct AppConfig {
     pub hide_on_escape: bool,
     pub theme_mode: String,
     pub tui_preview_side: String,
+    pub tui_pane_ratios: [u16; 3],
+    pub tui_keybinds: TuiKeybinds,
     pub custom_system_prompt: String,
     pub providers: Vec<ProviderProfile>,
     pub portals: Vec<PortalEntry>,
@@ -84,6 +116,8 @@ impl Default for AppConfig {
             hide_on_escape: true,
             theme_mode: "system".to_string(),
             tui_preview_side: "right".to_string(),
+            tui_pane_ratios: [20, 60, 20],
+            tui_keybinds: TuiKeybinds::default(),
             custom_system_prompt: String::new(),
             providers: default_providers(),
             portals: default_portals(),

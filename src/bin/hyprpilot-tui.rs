@@ -33,7 +33,7 @@ use hyprpilot::preview::{
     PreviewKind, detect_preview_kind, expand_user_path, extract_pdf_text,
     html_to_readable_markdown, inspect_pdf, render_pdf_page_png,
 };
-use hyprpilot::storage::config::{AppConfig, AuthMode, state_dir, tui_socket_path};
+use hyprpilot::storage::config::{AppConfig, AuthMode, TuiKeybinds, state_dir, tui_socket_path};
 use hyprpilot::storage::db::{ConversationSummary, HistoryDb, derive_title_from_prompt};
 
 // ---------------------------------------------------------------------------
@@ -46,16 +46,28 @@ struct WireMessage {
     content: String,
 }
 
+fn default_pane_ratios() -> [u16; 3] {
+    [20, 60, 20]
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SessionSnapshot {
     provider_id: String,
     provider_name: String,
+    #[serde(default)]
     provider_kind: String,
+    #[serde(default)]
     provider_auth: String,
+    #[serde(default)]
     provider_base_url: String,
     model: String,
     linux_quick_mode: bool,
+    #[serde(default)]
     preview_side: String,
+    #[serde(default = "default_pane_ratios")]
+    pane_ratios: [u16; 3],
+    #[serde(default)]
+    keybinds: TuiKeybinds,
     active_conversation_id: Option<i64>,
     messages: Vec<WireMessage>,
     streaming: bool,
@@ -84,6 +96,9 @@ enum ClientCmd {
     FetchModels,
     ToggleLinuxQuick,
     SetPreviewSide { side: String },
+    SetPaneRatios { ratios: [u16; 3] },
+    UpdateKeybind { action: String, key: String },
+    ResetKeybinds,
     LoadConversation { id: i64 },
     QuitDaemon,
 }
@@ -168,6 +183,8 @@ impl DaemonState {
             model,
             linux_quick_mode: self.config.linux_quick_mode,
             preview_side: self.config.tui_preview_side.clone(),
+            pane_ratios: self.config.tui_pane_ratios,
+            keybinds: self.config.tui_keybinds.clone(),
             active_conversation_id: self.active_conversation_id,
             messages: self
                 .messages
@@ -402,6 +419,45 @@ fn handle_daemon_cmd(
             guard.config.tui_preview_side = normalized.clone();
             let _ = guard.config.save();
             guard.status = format!("Preview side: {normalized}");
+            guard.broadcast_snapshot();
+        }
+        ClientCmd::SetPaneRatios { ratios } => {
+            let mut guard = state.lock().unwrap();
+            let sum: u16 = ratios.iter().sum();
+            if sum == 100 && ratios.iter().all(|&r| r >= 10) {
+                guard.config.tui_pane_ratios = ratios;
+                let _ = guard.config.save();
+                guard.status = format!("Layout proportions: {}/{}/{}", ratios[0], ratios[1], ratios[2]);
+            } else {
+                guard.status = "Layout ratios must sum to 100 (min 10 each)".to_string();
+            }
+            guard.broadcast_snapshot();
+        }
+        ClientCmd::UpdateKeybind { action, key } => {
+            let mut guard = state.lock().unwrap();
+            let kb = &mut guard.config.tui_keybinds;
+            match action.as_str() {
+                "toggle_preview" => kb.toggle_preview = key.clone(),
+                "swap_side" => kb.swap_side = key.clone(),
+                "copy_section" => kb.copy_section = key.clone(),
+                "search" => kb.search = key.clone(),
+                "command" => kb.command = key.clone(),
+                "help" => kb.help = key.clone(),
+                "focus_left" => kb.focus_left = key.clone(),
+                "focus_right" => kb.focus_right = key.clone(),
+                "new_chat" => kb.new_chat = key.clone(),
+                _ => {}
+            }
+            let _ = guard.config.save();
+            guard.status = format!("Rebound {action} -> {key}");
+            guard.broadcast_snapshot();
+        }
+        ClientCmd::ResetKeybinds => {
+            let mut guard = state.lock().unwrap();
+            guard.config.tui_keybinds = TuiKeybinds::default();
+            guard.config.tui_pane_ratios = [20, 60, 20];
+            let _ = guard.config.save();
+            guard.status = "Reset TUI keybindings & 20/60/20 layout".to_string();
             guard.broadcast_snapshot();
         }
         ClientCmd::SelectProvider { id } => {
@@ -864,7 +920,10 @@ enum Modal {
     Provider(ListState),
     Model(ListState),
     History(ListState),
-    Help,
+    Help {
+        selected: usize,
+        awaiting_key: bool,
+    },
     MarkdownPicker {
         files: Vec<String>,
         list_state: ListState,
@@ -923,6 +982,7 @@ struct TuiClient {
     was_streaming: bool,
     history_state: ListState,
     inspector_model_state: ListState,
+    force_panes: Option<bool>,
 }
 
 impl TuiClient {
@@ -937,6 +997,8 @@ impl TuiClient {
             model: "-".into(),
             linux_quick_mode: true,
             preview_side: "right".into(),
+            pane_ratios: [20, 60, 20],
+            keybinds: TuiKeybinds::default(),
             active_conversation_id: None,
             messages: Vec::new(),
             streaming: false,
@@ -972,6 +1034,7 @@ impl TuiClient {
             was_streaming: false,
             history_state: ListState::default(),
             inspector_model_state: ListState::default(),
+            force_panes: None,
         };
         client.send_cmd(&ClientCmd::GetState);
         Ok(client)
@@ -1154,6 +1217,25 @@ impl TuiClient {
                     self.preview_open = false;
                     self.send_cmd(&ClientCmd::NewChat);
                 }
+                KeyCode::Char('b') => {
+                    self.force_panes = Some(!self.force_panes.unwrap_or(false));
+                }
+                KeyCode::Left => {
+                    self.vim_mode = VimMode::Normal;
+                    self.focus = match self.focus {
+                        FocusPane::Inspector => FocusPane::Chat,
+                        FocusPane::Chat => FocusPane::History,
+                        FocusPane::History => FocusPane::History,
+                    };
+                }
+                KeyCode::Right => {
+                    self.vim_mode = VimMode::Normal;
+                    self.focus = match self.focus {
+                        FocusPane::History => FocusPane::Chat,
+                        FocusPane::Chat => FocusPane::Inspector,
+                        FocusPane::Inspector => FocusPane::Inspector,
+                    };
+                }
                 KeyCode::Char('y') => self.open_copy_modal(),
                 KeyCode::Char('l') => self.send_cmd(&ClientCmd::ToggleLinuxQuick),
                 _ => {}
@@ -1163,6 +1245,17 @@ impl TuiClient {
 
         if mods.contains(KeyModifiers::ALT) {
             match code {
+                KeyCode::Char('1') => {
+                    self.vim_mode = VimMode::Normal;
+                    self.focus = FocusPane::History;
+                }
+                KeyCode::Char('2') => {
+                    self.focus = FocusPane::Chat;
+                }
+                KeyCode::Char('3') => {
+                    self.vim_mode = VimMode::Normal;
+                    self.focus = FocusPane::Inspector;
+                }
                 KeyCode::Char('p') => self.open_provider_modal(),
                 KeyCode::Char('m') => self.open_model_modal(),
                 KeyCode::Char('h') => self.open_history_modal(),
@@ -1205,11 +1298,24 @@ impl TuiClient {
                 self.pending_g = false;
                 self.pending_w = false;
             }
-            KeyCode::F(1) => self.modal = Modal::Help,
+            KeyCode::F(1) => {
+                self.modal = Modal::Help {
+                    selected: 0,
+                    awaiting_key: false,
+                }
+            }
             KeyCode::F(2) => self.open_provider_modal(),
             KeyCode::F(3) => self.open_model_modal(),
             KeyCode::F(4) => self.open_history_modal(),
             KeyCode::F(5) => self.send_cmd(&ClientCmd::FetchModels),
+            KeyCode::F(6) => {
+                self.vim_mode = VimMode::Normal;
+                self.focus = match self.focus {
+                    FocusPane::Chat => FocusPane::Inspector,
+                    FocusPane::Inspector => FocusPane::History,
+                    FocusPane::History => FocusPane::Chat,
+                };
+            }
             KeyCode::Tab => {
                 self.vim_mode = VimMode::Normal;
                 self.focus = match self.focus {
@@ -1298,7 +1404,17 @@ impl TuiClient {
                 self.vim_mode = VimMode::Command;
             }
             KeyCode::Char('?') | KeyCode::F(1) => {
-                self.modal = Modal::Help;
+                self.modal = Modal::Help {
+                    selected: 0,
+                    awaiting_key: false,
+                };
+            }
+            KeyCode::F(6) => {
+                self.focus = match self.focus {
+                    FocusPane::Chat => FocusPane::Inspector,
+                    FocusPane::Inspector => FocusPane::History,
+                    FocusPane::History => FocusPane::Chat,
+                };
             }
             KeyCode::Tab => {
                 self.focus = match self.focus {
@@ -1595,13 +1711,37 @@ impl TuiClient {
                     self.local_notice = Some("Usage: :side left | :side right".into());
                 }
             }
+            "layout" => {
+                let nums: Vec<u16> = raw
+                    .split_whitespace()
+                    .skip(1)
+                    .filter_map(|s| s.parse::<u16>().ok())
+                    .collect();
+                if nums.len() == 3 && nums.iter().sum::<u16>() == 100 && nums.iter().all(|&n| n >= 10)
+                {
+                    self.send_cmd(&ClientCmd::SetPaneRatios {
+                        ratios: [nums[0], nums[1], nums[2]],
+                    });
+                } else {
+                    self.local_notice =
+                        Some("Usage: :layout <left> <center> <right> (sum=100, e.g. :layout 20 60 20)".into());
+                }
+            }
+            "panes" => {
+                self.force_panes = Some(!self.force_panes.unwrap_or(false));
+            }
             "m" | "model" => self.open_model_modal(),
             "prov" | "provider" => self.open_provider_modal(),
             "hist" | "history" => self.open_history_modal(),
             "y" | "yank" | "copy" => self.open_copy_modal(),
             "r" | "refresh" => self.send_cmd(&ClientCmd::FetchModels),
             "o" | "open" => self.open_markdown_picker(),
-            "h" | "help" => self.modal = Modal::Help,
+            "h" | "help" => {
+                self.modal = Modal::Help {
+                    selected: 0,
+                    awaiting_key: false,
+                }
+            }
             _ => {
                 self.local_notice = Some(format!("Unknown command: :{cmd} (try :help)"));
             }
@@ -1862,11 +2002,87 @@ impl TuiClient {
             return;
         }
 
-        if matches!(self.modal, Modal::Help) {
+        if let Modal::Help {
+            selected,
+            awaiting_key,
+        } = &mut self.modal
+        {
+            const HELP_ITEMS: usize = 10;
+            if *awaiting_key {
+                let new_key = match code {
+                    KeyCode::Esc => {
+                        *awaiting_key = false;
+                        return;
+                    }
+                    KeyCode::Char(c) => c.to_string(),
+                    KeyCode::F(n) => format!("F{n}"),
+                    _ => return,
+                };
+                let action = match *selected {
+                    3 => "toggle_preview",
+                    4 => "swap_side",
+                    5 => "copy_section",
+                    6 => "search",
+                    7 => "command",
+                    8 => "focus_left",
+                    9 => "focus_right",
+                    _ => {
+                        *awaiting_key = false;
+                        return;
+                    }
+                };
+                *awaiting_key = false;
+                self.send_cmd(&ClientCmd::UpdateKeybind {
+                    action: action.to_string(),
+                    key: new_key,
+                });
+                return;
+            }
+
             match code {
-                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Enter => {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => {
                     self.modal = Modal::None;
                 }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    *selected = selected.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    *selected = (*selected + 1).min(HELP_ITEMS - 1);
+                }
+                KeyCode::Char('R') => {
+                    self.send_cmd(&ClientCmd::ResetKeybinds);
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => match *selected {
+                    0 => {
+                        let presets = [[20, 60, 20], [18, 64, 18], [25, 50, 25], [15, 70, 15]];
+                        let cur = self.snap.pane_ratios;
+                        let next_idx = presets
+                            .iter()
+                            .position(|&p| p == cur)
+                            .map(|i| (i + 1) % presets.len())
+                            .unwrap_or(0);
+                        self.send_cmd(&ClientCmd::SetPaneRatios {
+                            ratios: presets[next_idx],
+                        });
+                    }
+                    1 => {
+                        let next_side = if self.snap.preview_side == "left" {
+                            "right"
+                        } else {
+                            "left"
+                        };
+                        self.send_cmd(&ClientCmd::SetPreviewSide {
+                            side: next_side.to_string(),
+                        });
+                    }
+                    2 => {
+                        self.send_cmd(&ClientCmd::ToggleLinuxQuick);
+                    }
+                    3..=9 => {
+                        *awaiting_key = true;
+                    }
+                    _ => {}
+                },
                 _ => {}
             }
             return;
@@ -1927,7 +2143,7 @@ impl TuiClient {
                 }
             }
             Modal::None
-            | Modal::Help
+            | Modal::Help { .. }
             | Modal::MarkdownPicker { .. }
             | Modal::MarkdownViewer { .. }
             | Modal::CopyPicker { .. }
@@ -1937,9 +2153,10 @@ impl TuiClient {
 
     fn modal_len(&self) -> usize {
         match &self.modal {
-            Modal::None | Modal::Help | Modal::MarkdownViewer { .. } | Modal::CopyLines { .. } => {
-                0
-            }
+            Modal::None
+            | Modal::Help { .. }
+            | Modal::MarkdownViewer { .. }
+            | Modal::CopyLines { .. } => 0,
             Modal::Provider(_) => self.snap.providers.len(),
             Modal::Model(_) => self.snap.models.len(),
             Modal::History(_) => self.snap.history.len(),
@@ -1950,9 +2167,10 @@ impl TuiClient {
 
     fn modal_state_mut(&mut self) -> Option<&mut ListState> {
         match &mut self.modal {
-            Modal::None | Modal::Help | Modal::MarkdownViewer { .. } | Modal::CopyLines { .. } => {
-                None
-            }
+            Modal::None
+            | Modal::Help { .. }
+            | Modal::MarkdownViewer { .. }
+            | Modal::CopyLines { .. } => None,
             Modal::Provider(s)
             | Modal::Model(s)
             | Modal::History(s)
@@ -2098,7 +2316,11 @@ impl TuiClient {
         };
         let sections = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(10), Constraint::Min(5)])
+            .constraints([
+                Constraint::Length(9),
+                Constraint::Min(5),
+                Constraint::Length(9),
+            ])
             .split(area);
 
         let (ctx_win, tier, api_proto) =
@@ -2218,36 +2440,68 @@ impl TuiClient {
             )
             .highlight_symbol("▶ ");
         frame.render_stateful_widget(model_list, sections[1], &mut self.inspector_model_state);
+
+        // Lower-third: Recommended TUI Tips & Help Launcher
+        let kb = &self.snap.keybinds;
+        let tips_lines = vec![
+            Line::from(vec![
+                Span::styled(" Esc/i  ", Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD)),
+                Span::styled("Normal / Insert mode", Style::default().fg(Color::Gray)),
+            ]),
+            Line::from(vec![
+                Span::styled(" Alt+1/2/3 ", Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD)),
+                Span::styled("or F6: Switch panes", Style::default().fg(Color::Gray)),
+            ]),
+            Line::from(vec![
+                Span::styled(format!(" {}text  ", kb.search), Style::default().fg(Color::LightYellow).add_modifier(Modifier::BOLD)),
+                Span::styled("Search (n/N next/prev)", Style::default().fg(Color::Gray)),
+            ]),
+            Line::from(vec![
+                Span::styled(format!(" Ctrl+Y/{} ", kb.copy_section), Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)),
+                Span::styled("Clean section copy", Style::default().fg(Color::Gray)),
+            ]),
+            Line::from(vec![
+                Span::styled(format!(" {}/{}    ", kb.toggle_preview, kb.swap_side), Style::default().fg(Color::LightMagenta).add_modifier(Modifier::BOLD)),
+                Span::styled("Preview / Swap side", Style::default().fg(Color::Gray)),
+            ]),
+            Line::from(vec![
+                Span::styled(format!(" {}/F1   ", kb.help), Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD)),
+                Span::styled("Help & Keybind Config", Style::default().fg(Color::White)),
+            ]),
+        ];
+        let tips_box = Paragraph::new(tips_lines)
+            .wrap(Wrap { trim: true })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(Color::Rgb(70, 110, 145)))
+                    .title(Span::styled(
+                        " Tips & Shortcuts (? Help) ",
+                        Style::default()
+                            .fg(Color::LightCyan)
+                            .add_modifier(Modifier::BOLD),
+                    )),
+            );
+        frame.render_widget(tips_box, sections[2]);
     }
 
     fn render(&mut self, frame: &mut ratatui::Frame<'_>) {
         let full_area = frame.area();
-        let wide_mode = full_area.width >= 104;
+        // Only enable 3-pane layout in true fullscreen/wide terminals (>= 150 cols),
+        // keeping the initial ~50% Alt+Space popup focused on Chat only (unless preview is open or forced).
+        let wide_mode = self.force_panes.unwrap_or(full_area.width >= 150);
+        let [r_left, r_center, r_right] = self.snap.pane_ratios;
 
-        // Responsive 3-pane centered layout when wide/fullscreen, or 2-pane split when preview open in compact mode
         let (left_area, center_area, right_area): (Option<Rect>, Rect, Option<Rect>) = if wide_mode {
-            let max_center = 104u16;
-            let side_total = full_area.width.saturating_sub(max_center);
-            let cols = if full_area.width > 180 {
-                let side_each = (side_total / 2).max(30);
-                Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([
-                        Constraint::Length(side_each),
-                        Constraint::Min(max_center),
-                        Constraint::Length(side_each),
-                    ])
-                    .split(full_area)
-            } else {
-                Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([
-                        Constraint::Percentage(23),
-                        Constraint::Percentage(52),
-                        Constraint::Percentage(25),
-                    ])
-                    .split(full_area)
-            };
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Percentage(r_left),
+                    Constraint::Percentage(r_center),
+                    Constraint::Percentage(r_right),
+                ])
+                .split(full_area);
             (Some(cols[0]), cols[1], Some(cols[2]))
         } else if self.preview_open {
             if self.snap.preview_side == "left" {
@@ -2586,48 +2840,127 @@ impl TuiClient {
         // Modals
         match &mut self.modal {
             Modal::None => {}
-            Modal::Help => {
-                let area = centered_rect(76, 76, frame.area());
+            Modal::Help {
+                selected,
+                awaiting_key,
+            } => {
+                let area = centered_rect(82, 82, frame.area());
                 frame.render_widget(Clear, area);
-                let help_lines = vec![
-                    Line::from(Span::styled(
-                        "  Neovim / Vim Navigation & Commands",
-                        Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD),
-                    )),
-                    Line::from(""),
-                    Line::from("  Esc (Insert)     -> Enter Normal Mode"),
-                    Line::from("  i / a / o        -> Enter Insert Mode"),
-                    Line::from("  q / Esc (Normal) -> Hide / Exit TUI"),
-                    Line::from("  j / k / Ctrl+D/U -> Scroll down / up / half-page"),
-                    Line::from("  gg / G           -> Jump to top / bottom"),
-                    Line::from("  /query           -> Search transcript (n / N: next / prev match)"),
-                    Line::from("  :cmd             -> :new  :p(review)  :side left|right  :model  :copy  :q"),
-                    Line::from(""),
-                    Line::from(Span::styled(
-                        "  3-Pane Layout & Live Artifact Preview",
-                        Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD),
-                    )),
-                    Line::from(""),
-                    Line::from("  Ctrl+W h / l / w -> Focus Recent Chats (Left) / Chat / Model & Preview (Right)"),
-                    Line::from("  Tab              -> Cycle pane focus (Enter loads chat or switches model)"),
-                    Line::from("  p / Ctrl+E       -> Toggle Live Markdown / HTML / Code Artifact Preview"),
-                    Line::from("  s                -> Swap Preview side (left <-> right, persisted)"),
-                    Line::from("  [ / ]            -> Switch between artifacts in current reply"),
-                    Line::from("  y / Ctrl+Y       -> Copy clean section or Visual Line-Range (zero borders)"),
+                let parts = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(12), Constraint::Length(7)])
+                    .split(area);
+
+                let kb = &self.snap.keybinds;
+                let rows: [(&str, String); 10] = [
+                    (
+                        "Layout Proportions (L/C/R %)",
+                        format!(
+                            "{}% / {}% / {}%  (Enter: cycle presets, or :layout L C R)",
+                            self.snap.pane_ratios[0],
+                            self.snap.pane_ratios[1],
+                            self.snap.pane_ratios[2]
+                        ),
+                    ),
+                    (
+                        "Artifact Preview Side",
+                        format!("{}  (Enter: toggle left/right)", self.snap.preview_side),
+                    ),
+                    (
+                        "Linux Quick Mode",
+                        if self.snap.linux_quick_mode {
+                            "ON  (Enter: toggle)".into()
+                        } else {
+                            "OFF  (Enter: toggle)".into()
+                        },
+                    ),
+                    ("Key: Toggle Preview", kb.toggle_preview.clone()),
+                    ("Key: Swap Preview Side", kb.swap_side.clone()),
+                    ("Key: Copy Clean Section", kb.copy_section.clone()),
+                    ("Key: Search Transcript", kb.search.clone()),
+                    ("Key: Command Bar", kb.command.clone()),
+                    ("Key: Focus Left Pane", kb.focus_left.clone()),
+                    ("Key: Focus Right Pane", kb.focus_right.clone()),
                 ];
-                let p = Paragraph::new(help_lines)
+
+                let list_items: Vec<ListItem<'_>> = rows
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (label, val))| {
+                        let is_sel = i == *selected;
+                        let display_val = if is_sel && *awaiting_key {
+                            "Press new key (Esc to cancel)...".to_string()
+                        } else {
+                            val.clone()
+                        };
+                        let bg = if is_sel {
+                            Color::Rgb(42, 72, 122)
+                        } else {
+                            Color::Reset
+                        };
+                        ListItem::new(Line::from(vec![
+                            Span::styled(
+                                if is_sel { " ▶ " } else { "   " },
+                                Style::default().fg(Color::LightCyan).bg(bg),
+                            ),
+                            Span::styled(
+                                format!("{label:<30} "),
+                                Style::default()
+                                    .fg(Color::White)
+                                    .bg(bg)
+                                    .add_modifier(if is_sel {
+                                        Modifier::BOLD
+                                    } else {
+                                        Modifier::empty()
+                                    }),
+                            ),
+                            Span::styled(
+                                display_val,
+                                Style::default()
+                                    .fg(if is_sel && *awaiting_key {
+                                        Color::LightYellow
+                                    } else {
+                                        Color::LightGreen
+                                    })
+                                    .bg(bg),
+                            ),
+                        ]))
+                    })
+                    .collect();
+
+                let cfg_list = List::new(list_items).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(Color::LightCyan))
+                        .title(Span::styled(
+                            " HyprPilot TUI Help & Configurator (j/k:Move | Enter:Edit | R:Reset | Esc:Close) ",
+                            Style::default()
+                                .fg(Color::LightCyan)
+                                .add_modifier(Modifier::BOLD),
+                        )),
+                );
+                frame.render_widget(cfg_list, parts[0]);
+
+                let ref_lines = vec![
+                    Line::from("  Modes: Esc -> Normal | i/a/o -> Insert | / -> Search (n/N) | : -> Command (:new, :p, :layout 20 60 20, :q)"),
+                    Line::from("  Panes: Alt+1/2/3 or F6 or Ctrl+Left/Right or Ctrl+W h/l | Ctrl+B: Force 3-pane | j/k + Enter: Load/Switch"),
+                    Line::from("  Copy : Ctrl+Y or y -> Clean Section Picker (1-9 quick, v Visual Line-Range, zero TUI borders)"),
+                    Line::from("  Files: Ctrl+O -> Open .md/.html/.pdf/.svg | [ / ] -> Switch artifacts | x -> Close preview"),
+                ];
+                let ref_box = Paragraph::new(ref_lines)
                     .wrap(Wrap { trim: false })
                     .block(
                         Block::default()
                             .borders(Borders::ALL)
                             .border_type(BorderType::Rounded)
-                            .border_style(Style::default().fg(Color::LightCyan))
+                            .border_style(Style::default().fg(Color::Rgb(85, 110, 150)))
                             .title(Span::styled(
-                                " HyprPilot TUI Help (Esc / q to close) ",
-                                Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD),
+                                " Standard TUI Reference ",
+                                Style::default().fg(Color::LightYellow),
                             )),
                     );
-                frame.render_widget(p, area);
+                frame.render_widget(ref_box, parts[1]);
             }
             Modal::Provider(st) => {
                 let items: Vec<ListItem<'_>> = self
