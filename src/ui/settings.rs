@@ -22,6 +22,7 @@ pub fn show_settings_dialog<F>(
         .default_width(660)
         .default_height(600)
         .build();
+    settings_win.set_application(parent.application().as_ref());
 
     let view_stack = adw::ViewStack::new();
     let general_page = build_general_page(config.clone());

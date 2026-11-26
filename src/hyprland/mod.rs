@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-use crate::APP_ID;
+use crate::{APP_ID, APP_NAME};
 use crate::storage::config::{AppConfig, format_hyprland_hotkey, socket_path, state_dir};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,6 +28,8 @@ struct HyprClient {
     class: String,
     #[serde(rename = "initialClass", default)]
     initial_class: String,
+    #[serde(default)]
+    title: String,
     at: [i32; 2],
     size: [i32; 2],
     #[serde(default)]
@@ -112,9 +114,14 @@ fn dispatch_toggle_fullscreen() {
 fn find_hyprpilot_client() -> Result<Option<HyprClient>> {
     let raw = run_hyprctl(&["-j", "clients"])?;
     let clients: Vec<HyprClient> = serde_json::from_str(&raw)?;
-    Ok(clients
+    let matching: Vec<HyprClient> = clients
         .into_iter()
-        .find(|c| c.class == APP_ID || c.initial_class == APP_ID))
+        .filter(|c| c.class == APP_ID || c.initial_class == APP_ID)
+        .collect();
+    if let Some(pos) = matching.iter().position(|c| c.title == APP_NAME) {
+        return Ok(Some(matching.into_iter().nth(pos).unwrap()));
+    }
+    Ok(matching.into_iter().next())
 }
 
 fn apply_geometry_to_address(address: &str, geom: &SavedGeometry) {

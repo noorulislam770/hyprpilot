@@ -84,8 +84,9 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
     // Clicking window close button hides to background rather than exiting
     {
         let win = window.clone();
+        let app_ref = app.clone();
         window.connect_close_request(move |_| {
-            hide_to_background(&win);
+            hide_to_background(&win, &app_ref);
             gtk4::glib::Propagation::Stop
         });
     }
@@ -112,7 +113,8 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
     // Hide button
     {
         let win = window.clone();
-        hide_btn.connect_clicked(move |_| hide_to_background(&win));
+        let app_ref = app.clone();
+        hide_btn.connect_clicked(move |_| hide_to_background(&win, &app_ref));
     }
 
     // Quit button
@@ -153,7 +155,7 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
                 return gtk4::glib::Propagation::Stop;
             }
             if key == gdk::Key::Escape && cfg.borrow().hide_on_escape {
-                hide_to_background(&win);
+                hide_to_background(&win, &app_ref);
                 return gtk4::glib::Propagation::Stop;
             }
             if mods.contains(gdk::ModifierType::CONTROL_MASK) {
@@ -207,7 +209,13 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
     window
 }
 
-fn hide_to_background(win: &adw::ApplicationWindow) {
+fn hide_to_background(win: &adw::ApplicationWindow, app: &adw::Application) {
+    let main_win = win.upcast_ref::<gtk4::Window>();
+    for sub in app.windows() {
+        if &sub != main_win {
+            sub.close();
+        }
+    }
     let _ = snapshot_and_save_geometry();
     if win.is_fullscreen() {
         win.unfullscreen();
@@ -257,7 +265,7 @@ fn start_ipc_server(win: adw::ApplicationWindow, app: adw::Application) {
                     win.present();
                 }
                 "HIDE" => {
-                    hide_to_background(&win);
+                    hide_to_background(&win, &app);
                 }
                 "QUIT" => {
                     quit_app(&app);
