@@ -274,6 +274,66 @@ pub fn config_path() -> PathBuf {
     config_dir().join("config.toml")
 }
 
+pub fn tui_config_path() -> PathBuf {
+    config_dir().join("tui.toml")
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TuiConfig {
+    pub preview_side: String,
+    pub auto_preview_md: bool,
+    pub pane_ratios: [u16; 3],
+    pub start_mode: String,
+    pub show_tips: bool,
+    pub keybinds: TuiKeybinds,
+}
+
+impl Default for TuiConfig {
+    fn default() -> Self {
+        Self {
+            preview_side: "right".to_string(),
+            auto_preview_md: true,
+            pane_ratios: [20, 60, 20],
+            start_mode: "insert".to_string(),
+            show_tips: true,
+            keybinds: TuiKeybinds::default(),
+        }
+    }
+}
+
+impl TuiConfig {
+    pub fn load() -> Result<Self> {
+        let path = tui_config_path();
+        if !path.exists() {
+            // Seed from existing AppConfig TUI fields if present so upgrades are seamless
+            let mut cfg = Self::default();
+            if let Ok(app_cfg) = AppConfig::load() {
+                cfg.preview_side = app_cfg.tui_preview_side;
+                cfg.pane_ratios = app_cfg.tui_pane_ratios;
+                cfg.keybinds = app_cfg.tui_keybinds;
+            }
+            let _ = cfg.save();
+            return Ok(cfg);
+        }
+        let raw = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let cfg: TuiConfig = toml::from_str(&raw)
+            .with_context(|| format!("failed to parse {}", path.display()))?;
+        Ok(cfg)
+    }
+
+    pub fn save(&self) -> Result<()> {
+        let path = tui_config_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let raw = toml::to_string_pretty(self)?;
+        fs::write(&path, raw)?;
+        Ok(())
+    }
+}
+
 impl AppConfig {
     pub fn load() -> Result<Self> {
         let path = config_path();
