@@ -1,0 +1,70 @@
+.hyprpilot-window {
+    border-radius: 12px;
+}
+
+.chat-bubble-user {
+    background-color: alpha(@accent_bg_color, 0.22);
+    border: 1px solid alpha(@accent_bg_color, 0.45);
+    border-radius: 14px;
+    padding: 10px 14px;
+}
+
+.chat-bubble-assistant {
+    background-color: alpha(@card_bg_color, 0.85);
+    border: 1px solid alpha(@borders, 0.65);
+    border-radius: 14px;
+    padding: 10px 14px;
+}
+
+.chat-bubble-error {
+    background-color: alpha(@error_bg_color, 0.25);
+    border: 1px solid alpha(@error_color, 0.6);
+    border-radius: 12px;
+    padding: 10px 14px;
+}
+
+.code-card {
+    background-color: rgba(18, 20, 26, 0.92);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 10px;
+    padding: 8px 10px;
+}
+
+.code-card-lang {
+    font-size: 11px;
+    opacity: 0.7;
+    font-weight: 600;
+}
+
+.code-card-text {
+    font-family: monospace;
+    font-size: 12.5px;
+    color: #e6edf3;
+}
+
+.composer-frame {
+    background-color: alpha(@card_bg_color, 0.9);
+    border: 1px solid alpha(@borders, 0.8);
+    border-radius: 14px;
+    padding: 6px 10px;
+}
+
+.composer-textview {
+    background: transparent;
+}
+
+.portal-tab-bar {
+    padding: 6px 10px;
+    border-bottom: 1px solid alpha(@borders, 0.5);
+}
+
+.history-sidebar {
+    border-right: 1px solid alpha(@borders, 0.5);
+    background-color: alpha(@sidebar_bg_color, 0.6);
+}
+
+.role-label {
+    font-size: 11px;
+    font-weight: 700;
+    opacity: 0.72;
+}

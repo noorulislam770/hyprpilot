@@ -1,0 +1,33 @@
+[package]
+name = "hyprpilot"
+version = "0.1.0"
+edition = "2024"
+description = "Lightweight Copilot-style AI assistant for Arch Linux & Hyprland with native API streaming and persistent WebKitGTK web portals"
+license = "MIT"
+
+[features]
+default = ["web-portal"]
+web-portal = ["dep:webkit6"]
+
+[[bin]]
+name = "hyprpilot"
+path = "src/main.rs"
+
+[[bin]]
+name = "hyprpilot-toggle"
+path = "src/bin/hyprpilot-toggle.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
+futures-util = "0.3"
+gtk4 = { version = "0.11", features = ["v4_14"] }
+libadwaita = { version = "0.9", features = ["v1_6"] }
+reqwest = { version = "0.13", features = ["json", "stream"] }
+rusqlite = { version = "0.38", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process"] }
+toml = "1.0"
+webkit6 = { version = "0.6", optional = true, features = ["v2_46"] }
