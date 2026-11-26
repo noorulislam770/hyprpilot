@@ -534,12 +534,17 @@ fn connect_or_spawn_daemon() -> Result<(UnixStream, mpsc::UnboundedReceiver<Serv
         Ok(s) => s,
         Err(_) => {
             let exe = std::env::current_exe()?;
-            Command::new(exe)
-                .arg("--daemon")
+            let mut cmd = Command::new(exe);
+            cmd.arg("--daemon")
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
+                .stderr(Stdio::null());
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                cmd.process_group(0);
+            }
+            cmd.spawn()
                 .context("failed to start hyprpilot-tui daemon")?;
 
             let mut connected = None;
