@@ -1,5 +1,6 @@
 pub mod anthropic;
 pub mod gemini;
+pub mod models;
 pub mod openai_compat;
 
 use anyhow::{Context, Result};

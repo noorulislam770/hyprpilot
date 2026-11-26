@@ -1,16 +1,20 @@
 use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
+use tokio::runtime::Runtime;
+use tokio::sync::oneshot;
 
+use crate::ai::models::fetch_available_models;
 use crate::hyprland::sync_hyprland_config;
 use crate::storage::config::{AppConfig, AuthMode, PortalEntry, ProviderKind, ProviderProfile};
 
 pub fn show_settings_dialog<F>(
     parent: &adw::ApplicationWindow,
     config: Rc<RefCell<AppConfig>>,
+    runtime: Rc<Runtime>,
     on_saved: F,
 ) where
     F: Fn(&AppConfig) + 'static,
@@ -20,13 +24,13 @@ pub fn show_settings_dialog<F>(
         .transient_for(parent)
         .modal(true)
         .default_width(660)
-        .default_height(600)
+        .default_height(620)
         .build();
     settings_win.set_application(parent.application().as_ref());
 
     let view_stack = adw::ViewStack::new();
     let general_page = build_general_page(config.clone());
-    let providers_page = build_providers_page(config.clone());
+    let providers_page = build_providers_page(config.clone(), runtime);
     let portals_page = build_portals_page(config.clone());
 
     let p1 = view_stack.add_titled(&general_page, Some("general"), "General & Hyprland");
@@ -184,7 +188,7 @@ fn build_general_page(config: Rc<RefCell<AppConfig>>) -> adw::PreferencesPage {
     page
 }
 
-fn build_providers_page(config: Rc<RefCell<AppConfig>>) -> adw::PreferencesPage {
+fn build_providers_page(config: Rc<RefCell<AppConfig>>, runtime: Rc<Runtime>) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::new();
     page.set_title("Native AI & Tokens");
     page.set_icon_name(Some("network-server-symbolic"));
@@ -234,8 +238,15 @@ fn build_providers_page(config: Rc<RefCell<AppConfig>>) -> adw::PreferencesPage 
     let base_url_row = adw::EntryRow::new();
     base_url_row.set_title("Base URL");
 
+    let model_combo = adw::ComboRow::new();
+    model_combo.set_title("Available Models (lightweight first)");
+
+    let fetch_btn = gtk4::Button::with_label("Fetch Models");
+    fetch_btn.set_valign(gtk4::Align::Center);
+    model_combo.add_suffix(&fetch_btn);
+
     let model_row = adw::EntryRow::new();
-    model_row.set_title("Model ID");
+    model_row.set_title("Selected / Custom Model ID");
 
     let headers_row = adw::EntryRow::new();
     headers_row.set_title("Extra Headers (comma-sep Key:Value)");
@@ -244,12 +255,42 @@ fn build_providers_page(config: Rc<RefCell<AppConfig>>) -> adw::PreferencesPage 
     save_btn.add_css_class("suggested-action");
     save_btn.set_valign(gtk4::Align::Center);
     let save_row = adw::ActionRow::new();
-    save_row.set_title("Save selected provider credentials");
+    save_row.set_title("Save credentials & auto-fetch models");
     save_row.add_suffix(&save_btn);
 
     let saved_lbl = gtk4::Label::new(None);
     saved_lbl.add_css_class("dim-label");
     saved_lbl.set_halign(gtk4::Align::Start);
+    saved_lbl.set_wrap(true);
+
+    let syncing = Rc::new(Cell::new(false));
+    let fetched_models: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+
+    let update_model_combo = {
+        let model_combo = model_combo.clone();
+        let fetched_models = fetched_models.clone();
+        let syncing = syncing.clone();
+        move |models: &[String], current_model: &str| {
+            let mut list: Vec<String> = models.to_vec();
+            if list.is_empty() && !current_model.trim().is_empty() {
+                list.push(current_model.trim().to_string());
+            } else if !current_model.trim().is_empty() && !list.iter().any(|m| m == current_model.trim()) {
+                list.push(current_model.trim().to_string());
+            }
+            let selected = list
+                .iter()
+                .position(|m| m == current_model.trim())
+                .unwrap_or(0);
+            let refs: Vec<&str> = list.iter().map(|s| s.as_str()).collect();
+            *fetched_models.borrow_mut() = list.clone();
+            syncing.set(true);
+            model_combo.set_model(Some(&gtk4::StringList::new(&refs)));
+            if !refs.is_empty() {
+                model_combo.set_selected(selected as u32);
+            }
+            syncing.set(false);
+        }
+    };
 
     let populate = {
         let cfg = config.clone();
@@ -258,9 +299,10 @@ fn build_providers_page(config: Rc<RefCell<AppConfig>>) -> adw::PreferencesPage 
         let base_url_row = base_url_row.clone();
         let model_row = model_row.clone();
         let headers_row = headers_row.clone();
+        let update_model_combo = update_model_combo.clone();
         move |idx: usize| {
-            let guard = cfg.borrow();
-            if let Some(p) = guard.providers.get(idx) {
+            let snapshot = cfg.borrow().providers.get(idx).cloned();
+            if let Some(p) = snapshot {
                 auth_row.set_selected(auth_to_idx(&p.auth_mode));
                 token_row.set_text(&p.token);
                 base_url_row.set_text(&p.base_url);
@@ -272,6 +314,7 @@ fn build_providers_page(config: Rc<RefCell<AppConfig>>) -> adw::PreferencesPage 
                     .collect::<Vec<_>>()
                     .join(", ");
                 headers_row.set_text(&hdrs);
+                update_model_combo(&p.available_models, &p.model);
             }
         }
     };
@@ -285,10 +328,112 @@ fn build_providers_page(config: Rc<RefCell<AppConfig>>) -> adw::PreferencesPage 
     selector.set_selected(active_idx as u32);
     populate(active_idx);
 
+    {
+        let syncing_sel = syncing.clone();
+        let fetched_sel = fetched_models.clone();
+        let mod_row_sel = model_row.clone();
+        model_combo.connect_selected_notify(move |c| {
+            if syncing_sel.get() {
+                return;
+            }
+            let idx = c.selected() as usize;
+            if let Some(m) = fetched_sel.borrow().get(idx).cloned() {
+                mod_row_sel.set_text(&m);
+            }
+        });
+    }
+
     let pop_clone = populate.clone();
     selector.connect_selected_notify(move |s| {
         pop_clone(s.selected() as usize);
     });
+
+    let trigger_fetch = {
+        let cfg_fetch = config.clone();
+        let sel_ref = selector.clone();
+        let auth_ref = auth_row.clone();
+        let tok_ref = token_row.clone();
+        let url_ref = base_url_row.clone();
+        let hdr_ref = headers_row.clone();
+        let mod_ref = model_row.clone();
+        let lbl_ref = saved_lbl.clone();
+        let fetch_btn_ref = fetch_btn.clone();
+        let update_combo = update_model_combo.clone();
+        let rt = runtime.clone();
+        let http = reqwest::Client::new();
+        move || {
+            let idx = sel_ref.selected() as usize;
+            let profile_opt = {
+                let mut cfg = cfg_fetch.borrow_mut();
+                if let Some(p) = cfg.providers.get_mut(idx) {
+                    p.auth_mode = idx_to_auth(auth_ref.selected());
+                    p.token = tok_ref.text().trim().to_string();
+                    p.base_url = url_ref.text().trim().to_string();
+                    p.extra_headers = parse_headers(&hdr_ref.text());
+                    Some(p.clone())
+                } else {
+                    None
+                }
+            };
+            let Some(profile) = profile_opt else { return };
+            fetch_btn_ref.set_sensitive(false);
+            lbl_ref.set_text(&format!("Fetching available models from {}...", profile.name));
+
+            let (tx, rx) = oneshot::channel();
+            let client = http.clone();
+            let prof_for_req = profile.clone();
+            rt.spawn(async move {
+                let res = fetch_available_models(&client, &prof_for_req).await;
+                let _ = tx.send(res);
+            });
+
+            let cfg_done = cfg_fetch.clone();
+            let lbl_done = lbl_ref.clone();
+            let mod_done = mod_ref.clone();
+            let btn_done = fetch_btn_ref.clone();
+            let upd_done = update_combo.clone();
+            let sel_done = sel_ref.clone();
+            gtk4::glib::MainContext::default().spawn_local(async move {
+                if let Ok(res) = rx.await {
+                    match res {
+                        Ok(fetched) => {
+                            let count = fetched.models.len();
+                            let chosen = fetched.recommended.clone().unwrap_or_default();
+                            {
+                                let mut cfg = cfg_done.borrow_mut();
+                                if let Some(p) = cfg.providers.get_mut(idx) {
+                                    p.available_models = fetched.models.clone();
+                                    if !chosen.is_empty() {
+                                        p.model = chosen.clone();
+                                    }
+                                    cfg.active_provider_id = p.id.clone();
+                                    let _ = cfg.save();
+                                }
+                            }
+                            if sel_done.selected() as usize == idx {
+                                if !chosen.is_empty() {
+                                    mod_done.set_text(&chosen);
+                                }
+                                upd_done(&fetched.models, &chosen);
+                            }
+                            lbl_done.set_text(&format!(
+                                "Fetched {count} models — selected lightweight model: {chosen}"
+                            ));
+                        }
+                        Err(e) => {
+                            lbl_done.set_text(&format!("Model fetch failed: {e:#}"));
+                        }
+                    }
+                }
+                btn_done.set_sensitive(true);
+            });
+        }
+    };
+
+    {
+        let tf = trigger_fetch.clone();
+        fetch_btn.connect_clicked(move |_| tf());
+    }
 
     let cfg_save = config.clone();
     let sel_ref = selector.clone();
@@ -298,23 +443,34 @@ fn build_providers_page(config: Rc<RefCell<AppConfig>>) -> adw::PreferencesPage 
     let mod_ref = model_row.clone();
     let hdr_ref = headers_row.clone();
     let lbl_ref = saved_lbl.clone();
+    let tf_on_save = trigger_fetch;
     save_btn.connect_clicked(move |_| {
         let idx = sel_ref.selected() as usize;
-        let mut cfg = cfg_save.borrow_mut();
-        let saved_info = if let Some(p) = cfg.providers.get_mut(idx) {
-            p.auth_mode = idx_to_auth(auth_ref.selected());
-            p.token = tok_ref.text().trim().to_string();
-            p.base_url = url_ref.text().trim().to_string();
-            p.model = mod_ref.text().trim().to_string();
-            p.extra_headers = parse_headers(&hdr_ref.text());
-            Some((p.id.clone(), p.name.clone()))
-        } else {
-            None
+        let saved_info = {
+            let mut cfg = cfg_save.borrow_mut();
+            let info = if let Some(p) = cfg.providers.get_mut(idx) {
+                p.auth_mode = idx_to_auth(auth_ref.selected());
+                p.token = tok_ref.text().trim().to_string();
+                p.base_url = url_ref.text().trim().to_string();
+                p.model = mod_ref.text().trim().to_string();
+                p.extra_headers = parse_headers(&hdr_ref.text());
+                let should_fetch = p.available_models.is_empty()
+                    && (!p.token.is_empty() || p.auth_mode == AuthMode::None);
+                Some((p.id.clone(), p.name.clone(), should_fetch))
+            } else {
+                None
+            };
+            if let Some((ref id, _, _)) = info {
+                cfg.active_provider_id = id.clone();
+                let _ = cfg.save();
+            }
+            info
         };
-        if let Some((id, name)) = saved_info {
-            cfg.active_provider_id = id;
-            let _ = cfg.save();
+        if let Some((_, name, should_fetch)) = saved_info {
             lbl_ref.set_text(&format!("Saved credentials for {name}"));
+            if should_fetch {
+                tf_on_save();
+            }
         }
     });
 
@@ -359,6 +515,7 @@ fn build_providers_page(config: Rc<RefCell<AppConfig>>) -> adw::PreferencesPage 
             auth_mode: AuthMode::BearerToken,
             base_url: url,
             model: if model.is_empty() { "default".into() } else { model },
+            available_models: Vec::new(),
             token: String::new(),
             extra_headers: BTreeMap::new(),
         });
@@ -373,6 +530,7 @@ fn build_providers_page(config: Rc<RefCell<AppConfig>>) -> adw::PreferencesPage 
     group.add(&auth_row);
     group.add(&token_row);
     group.add(&base_url_row);
+    group.add(&model_combo);
     group.add(&model_row);
     group.add(&headers_row);
     group.add(&save_row);

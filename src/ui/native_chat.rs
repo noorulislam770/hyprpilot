@@ -3,11 +3,12 @@ use gtk4::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 use tokio::runtime::Runtime;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use super::copy_to_clipboard;
+use crate::ai::models::fetch_available_models;
 use crate::ai::{AiMessage, StreamEvent, stream_chat};
-use crate::storage::config::AppConfig;
+use crate::storage::config::{AppConfig, AuthMode};
 use crate::storage::db::{HistoryDb, derive_title_from_prompt};
 
 #[derive(Clone)]
@@ -34,6 +35,9 @@ struct ChatState {
     send_btn: gtk4::Button,
     provider_dropdown: gtk4::DropDown,
     provider_ids: Vec<String>,
+    model_dropdown: gtk4::DropDown,
+    model_ids: Vec<String>,
+    fetch_models_btn: gtk4::Button,
     linux_btn: gtk4::ToggleButton,
     status_lbl: gtk4::Label,
 }
@@ -92,7 +96,15 @@ impl NativeChatPane {
         sidebar_box.set_visible(false);
 
         let provider_dropdown = gtk4::DropDown::from_strings(&[]);
-        provider_dropdown.set_hexpand(true);
+
+        let model_dropdown = gtk4::DropDown::from_strings(&[]);
+        model_dropdown.set_hexpand(true);
+
+        let fetch_models_btn = gtk4::Button::from_icon_name("view-refresh-symbolic");
+        fetch_models_btn.set_tooltip_text(Some(
+            "Fetch available models & auto-select lightweight model",
+        ));
+        fetch_models_btn.add_css_class("flat");
 
         let linux_btn = gtk4::ToggleButton::with_label("Linux Quick");
         linux_btn.set_tooltip_text(Some("Concise Arch/Linux CLI answers"));
@@ -104,6 +116,8 @@ impl NativeChatPane {
 
         toolbar.append(&hist_toggle);
         toolbar.append(&provider_dropdown);
+        toolbar.append(&model_dropdown);
+        toolbar.append(&fetch_models_btn);
         toolbar.append(&linux_btn);
         toolbar.append(&clear_btn);
 
@@ -173,6 +187,9 @@ impl NativeChatPane {
             send_btn: send_btn.clone(),
             provider_dropdown: provider_dropdown.clone(),
             provider_ids: Vec::new(),
+            model_dropdown: model_dropdown.clone(),
+            model_ids: Vec::new(),
+            fetch_models_btn: fetch_models_btn.clone(),
             linux_btn: linux_btn.clone(),
             status_lbl: status_lbl.clone(),
         }));
@@ -188,11 +205,24 @@ impl NativeChatPane {
         pane.sync_providers_from_config();
         pane.render_welcome();
         pane.refresh_history();
-        pane.wire_signals(hist_toggle, new_chat_btn, clear_btn, search_entry, send_btn, composer, linux_btn, provider_dropdown);
+        pane.wire_signals(
+            hist_toggle,
+            new_chat_btn,
+            clear_btn,
+            search_entry,
+            send_btn,
+            composer,
+            linux_btn,
+            provider_dropdown,
+            model_dropdown,
+            fetch_models_btn,
+        );
+        pane.maybe_auto_fetch_active();
 
         pane
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn wire_signals(
         &self,
         hist_toggle: gtk4::ToggleButton,
@@ -203,6 +233,8 @@ impl NativeChatPane {
         composer: gtk4::TextView,
         linux_btn: gtk4::ToggleButton,
         provider_dropdown: gtk4::DropDown,
+        model_dropdown: gtk4::DropDown,
+        fetch_models_btn: gtk4::Button,
     ) {
         {
             let st = self.state.clone();
@@ -239,18 +271,48 @@ impl NativeChatPane {
         }
 
         {
-            let st = self.state.clone();
-            let cfg = self.config.clone();
+            let pane = self.clone();
             provider_dropdown.connect_selected_notify(move |dd| {
-                if st.borrow().syncing {
+                if pane.state.borrow().syncing {
                     return;
                 }
                 let idx = dd.selected() as usize;
-                if let Some(id) = st.borrow().provider_ids.get(idx).cloned() {
-                    let mut c = cfg.borrow_mut();
-                    c.active_provider_id = id;
+                let id_opt = pane.state.borrow().provider_ids.get(idx).cloned();
+                if let Some(id) = id_opt {
+                    {
+                        let mut c = pane.config.borrow_mut();
+                        c.active_provider_id = id;
+                        let _ = c.save();
+                    }
+                    pane.sync_models_from_active_provider();
+                    pane.maybe_auto_fetch_active();
+                }
+            });
+        }
+
+        {
+            let pane = self.clone();
+            model_dropdown.connect_selected_notify(move |dd| {
+                if pane.state.borrow().syncing {
+                    return;
+                }
+                let idx = dd.selected() as usize;
+                let model_opt = pane.state.borrow().model_ids.get(idx).cloned();
+                if let Some(model_id) = model_opt {
+                    let mut c = pane.config.borrow_mut();
+                    let active_id = c.active_provider_id.clone();
+                    if let Some(p) = c.providers.iter_mut().find(|p| p.id == active_id) {
+                        p.model = model_id;
+                    }
                     let _ = c.save();
                 }
+            });
+        }
+
+        {
+            let pane = self.clone();
+            fetch_models_btn.connect_clicked(move |_| {
+                pane.fetch_models_for_active();
             });
         }
 
@@ -281,11 +343,7 @@ impl NativeChatPane {
     pub fn sync_providers_from_config(&self) {
         let (labels, ids, active_idx, linux_quick) = {
             let cfg = self.config.borrow();
-            let labels: Vec<String> = cfg
-                .providers
-                .iter()
-                .map(|p| format!("{} — {}", p.name, p.model))
-                .collect();
+            let labels: Vec<String> = cfg.providers.iter().map(|p| p.name.clone()).collect();
             let ids: Vec<String> = cfg.providers.iter().map(|p| p.id.clone()).collect();
             let active_idx = ids
                 .iter()
@@ -307,6 +365,118 @@ impl NativeChatPane {
         linux_btn.set_active(linux_quick);
 
         self.state.borrow_mut().syncing = false;
+        self.sync_models_from_active_provider();
+    }
+
+    fn sync_models_from_active_provider(&self) {
+        let (models, active_model) = {
+            let cfg = self.config.borrow();
+            if let Some(p) = cfg.active_provider() {
+                let mut list = p.available_models.clone();
+                if list.is_empty() && !p.model.trim().is_empty() {
+                    list.push(p.model.trim().to_string());
+                } else if !p.model.trim().is_empty() && !list.iter().any(|m| m == p.model.trim()) {
+                    list.insert(0, p.model.trim().to_string());
+                }
+                (list, p.model.clone())
+            } else {
+                (Vec::new(), String::new())
+            }
+        };
+
+        let selected_idx = models
+            .iter()
+            .position(|m| m == active_model.trim())
+            .unwrap_or(0);
+        let refs: Vec<&str> = models.iter().map(|s| s.as_str()).collect();
+        let has_models = !refs.is_empty();
+        let model_list = gtk4::StringList::new(&refs);
+
+        let model_dd = {
+            let mut st = self.state.borrow_mut();
+            st.syncing = true;
+            st.model_ids = models;
+            st.model_dropdown.clone()
+        };
+
+        model_dd.set_model(Some(&model_list));
+        if has_models {
+            model_dd.set_selected(selected_idx as u32);
+        }
+
+        self.state.borrow_mut().syncing = false;
+    }
+
+    fn maybe_auto_fetch_active(&self) {
+        let should_fetch = {
+            let cfg = self.config.borrow();
+            cfg.active_provider().is_some_and(|p| {
+                p.available_models.is_empty()
+                    && (!p.token.trim().is_empty() || p.auth_mode == AuthMode::None)
+            })
+        };
+        if should_fetch {
+            self.fetch_models_for_active();
+        }
+    }
+
+    pub fn fetch_models_for_active(&self) {
+        let Some(provider) = self.config.borrow().active_provider().cloned() else {
+            return;
+        };
+        let target_id = provider.id.clone();
+
+        let (btn, status_lbl) = {
+            let st = self.state.borrow();
+            (st.fetch_models_btn.clone(), st.status_lbl.clone())
+        };
+        btn.set_sensitive(false);
+        status_lbl.set_text(&format!("Fetching models for {}...", provider.name));
+        status_lbl.set_visible(true);
+
+        let (tx, rx) = oneshot::channel();
+        let client = self.http.clone();
+        self.runtime.spawn(async move {
+            let res = fetch_available_models(&client, &provider).await;
+            let _ = tx.send(res);
+        });
+
+        let pane = self.clone();
+        gtk4::glib::MainContext::default().spawn_local(async move {
+            if let Ok(res) = rx.await {
+                match res {
+                    Ok(fetched) => {
+                        let count = fetched.models.len();
+                        let chosen = fetched.recommended.clone().unwrap_or_default();
+                        let still_active = {
+                            let mut cfg = pane.config.borrow_mut();
+                            if let Some(p) = cfg.providers.iter_mut().find(|p| p.id == target_id) {
+                                p.available_models = fetched.models;
+                                if !chosen.is_empty() {
+                                    p.model = chosen.clone();
+                                }
+                            }
+                            let _ = cfg.save();
+                            cfg.active_provider_id == target_id
+                        };
+                        if still_active {
+                            pane.sync_models_from_active_provider();
+                            let lbl = pane.state.borrow().status_lbl.clone();
+                            lbl.set_text(&format!(
+                                "Fetched {count} models — selected lightweight: {chosen}"
+                            ));
+                            lbl.set_visible(true);
+                        }
+                    }
+                    Err(e) => {
+                        let lbl = pane.state.borrow().status_lbl.clone();
+                        lbl.set_text(&format!("Model fetch failed: {e:#}"));
+                        lbl.set_visible(true);
+                    }
+                }
+            }
+            pane.state.borrow().fetch_models_btn.set_sensitive(true);
+        });
     }
 
     pub fn new_chat(&self) {

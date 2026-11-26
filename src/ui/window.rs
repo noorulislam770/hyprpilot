@@ -35,7 +35,7 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
     window.add_css_class("hyprpilot-window");
 
     let view_stack = adw::ViewStack::new();
-    let native_pane = NativeChatPane::new(config.clone(), runtime);
+    let native_pane = NativeChatPane::new(config.clone(), runtime.clone());
     let portal_pane = Rc::new(WebPortalPane::new(config.clone()));
 
     let native_page = view_stack.add_titled(&native_pane.root, Some("native"), "Native Chat");
@@ -129,10 +129,11 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
         let cfg = config.clone();
         let np = native_pane.clone();
         let pp = portal_pane.clone();
+        let rt = runtime.clone();
         settings_btn.connect_clicked(move |_| {
             let np2 = np.clone();
             let pp2 = pp.clone();
-            show_settings_dialog(&win, cfg.clone(), move |_| {
+            show_settings_dialog(&win, cfg.clone(), rt.clone(), move |_| {
                 np2.sync_providers_from_config();
                 pp2.rebuild_tabs();
             });
@@ -180,7 +181,7 @@ pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
                     gdk::Key::comma => {
                         let np2 = np.clone();
                         let pp2 = pp.clone();
-                        show_settings_dialog(&win, cfg.clone(), move |_| {
+                        show_settings_dialog(&win, cfg.clone(), runtime.clone(), move |_| {
                             np2.sync_providers_from_config();
                             pp2.rebuild_tabs();
                         });
