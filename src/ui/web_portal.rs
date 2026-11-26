@@ -23,6 +23,7 @@ struct PortalState {
     tab_bar: gtk4::Box,
     active_id: String,
     url_label: gtk4::Label,
+    syncing: bool,
 }
 
 impl WebPortalPane {
@@ -97,6 +98,7 @@ impl WebPortalPane {
                 tab_bar,
                 active_id,
                 url_label,
+                syncing: false,
             }));
 
             let pane = Self {
@@ -196,6 +198,9 @@ impl WebPortalPane {
                 let st_ref = self.inner.clone();
                 let cfg_ref = self.config.clone();
                 btn.connect_clicked(move |b| {
+                    if st_ref.borrow().syncing {
+                        return;
+                    }
                     if b.is_active() {
                         Self::activate_portal(&st_ref, &cfg_ref, &pid);
                     } else if st_ref.borrow().active_id == pid {
@@ -275,22 +280,30 @@ impl WebPortalPane {
             inner.borrow_mut().views.insert(id.to_string(), webview);
         }
 
-        let mut st = inner.borrow_mut();
-        st.active_id = id.to_string();
-        st.stack.set_visible_child_name(id);
-        for (btn_id, btn) in &st.buttons {
-            let should_be_active = btn_id == id;
+        let button_updates: Vec<(gtk4::ToggleButton, bool)> = {
+            let mut st = inner.borrow_mut();
+            st.syncing = true;
+            st.active_id = id.to_string();
+            st.stack.set_visible_child_name(id);
+            if let Some(view) = st.views.get(id) {
+                if let Some(uri) = view.uri() {
+                    st.url_label.set_text(uri.as_str());
+                } else if let Some(u) = st.urls.get(id) {
+                    st.url_label.set_text(u);
+                }
+            }
+            st.buttons
+                .iter()
+                .map(|(btn_id, btn)| (btn.clone(), btn_id == id))
+                .collect()
+        };
+
+        for (btn, should_be_active) in button_updates {
             if btn.is_active() != should_be_active {
                 btn.set_active(should_be_active);
             }
         }
-        if let Some(view) = st.views.get(id) {
-            if let Some(uri) = view.uri() {
-                st.url_label.set_text(uri.as_str());
-            } else if let Some(u) = st.urls.get(id) {
-                st.url_label.set_text(u);
-            }
-        }
+        inner.borrow_mut().syncing = false;
         config.borrow_mut().active_portal_id = id.to_string();
     }
 }

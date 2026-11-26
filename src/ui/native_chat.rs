@@ -24,6 +24,7 @@ struct ChatState {
     active_conversation_id: Option<i64>,
     messages: Vec<AiMessage>,
     streaming: bool,
+    syncing: bool,
     sidebar_box: gtk4::Box,
     history_list: gtk4::ListBox,
     search_entry: gtk4::SearchEntry,
@@ -162,6 +163,7 @@ impl NativeChatPane {
             active_conversation_id: None,
             messages: Vec::new(),
             streaming: false,
+            syncing: false,
             sidebar_box: sidebar_box.clone(),
             history_list: history_list.clone(),
             search_entry: search_entry.clone(),
@@ -224,8 +226,12 @@ impl NativeChatPane {
         }
 
         {
+            let st = self.state.clone();
             let cfg = self.config.clone();
             linux_btn.connect_toggled(move |b| {
+                if st.borrow().syncing {
+                    return;
+                }
                 let mut c = cfg.borrow_mut();
                 c.linux_quick_mode = b.is_active();
                 let _ = c.save();
@@ -236,6 +242,9 @@ impl NativeChatPane {
             let st = self.state.clone();
             let cfg = self.config.clone();
             provider_dropdown.connect_selected_notify(move |dd| {
+                if st.borrow().syncing {
+                    return;
+                }
                 let idx = dd.selected() as usize;
                 if let Some(id) = st.borrow().provider_ids.get(idx).cloned() {
                     let mut c = cfg.borrow_mut();
@@ -270,25 +279,34 @@ impl NativeChatPane {
     }
 
     pub fn sync_providers_from_config(&self) {
-        let cfg = self.config.borrow();
-        let labels: Vec<String> = cfg
-            .providers
-            .iter()
-            .map(|p| format!("{} — {}", p.name, p.model))
-            .collect();
+        let (labels, ids, active_idx, linux_quick) = {
+            let cfg = self.config.borrow();
+            let labels: Vec<String> = cfg
+                .providers
+                .iter()
+                .map(|p| format!("{} — {}", p.name, p.model))
+                .collect();
+            let ids: Vec<String> = cfg.providers.iter().map(|p| p.id.clone()).collect();
+            let active_idx = ids
+                .iter()
+                .position(|id| id == &cfg.active_provider_id)
+                .unwrap_or(0);
+            (labels, ids, active_idx, cfg.linux_quick_mode)
+        };
         let refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
-        let ids: Vec<String> = cfg.providers.iter().map(|p| p.id.clone()).collect();
-        let active_idx = ids
-            .iter()
-            .position(|id| id == &cfg.active_provider_id)
-            .unwrap_or(0);
 
-        let mut st = self.state.borrow_mut();
-        st.provider_ids = ids;
-        st.provider_dropdown
-            .set_model(Some(&gtk4::StringList::new(&refs)));
-        st.provider_dropdown.set_selected(active_idx as u32);
-        st.linux_btn.set_active(cfg.linux_quick_mode);
+        let (dropdown, linux_btn) = {
+            let mut st = self.state.borrow_mut();
+            st.syncing = true;
+            st.provider_ids = ids;
+            (st.provider_dropdown.clone(), st.linux_btn.clone())
+        };
+
+        dropdown.set_model(Some(&gtk4::StringList::new(&refs)));
+        dropdown.set_selected(active_idx as u32);
+        linux_btn.set_active(linux_quick);
+
+        self.state.borrow_mut().syncing = false;
     }
 
     pub fn new_chat(&self) {
