@@ -7,9 +7,10 @@ use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, oneshot};
 
 use super::copy_to_clipboard;
-use super::markdown_gtk::render_markdown_widgets;
+use super::markdown_gtk::{PreviewCallback, render_markdown_widgets_with_preview};
 use crate::ai::models::fetch_available_models;
 use crate::ai::{AiMessage, StreamEvent, stream_chat};
+use crate::preview::PreviewKind;
 use crate::storage::config::{AppConfig, AuthMode};
 use crate::storage::db::{HistoryDb, derive_title_from_prompt};
 
@@ -29,6 +30,7 @@ pub struct NativeChatPane {
     runtime: Rc<Runtime>,
     http: reqwest::Client,
     on_title_change: Rc<RefCell<Option<Rc<dyn Fn(&str)>>>>,
+    on_preview: Rc<RefCell<Option<PreviewCallback>>>,
 }
 
 struct ChatState {
@@ -301,6 +303,7 @@ impl NativeChatPane {
             runtime,
             http: reqwest::Client::new(),
             on_title_change: Rc::new(RefCell::new(None)),
+            on_preview: Rc::new(RefCell::new(None)),
         };
 
         pane.sync_providers_from_config();
@@ -324,6 +327,10 @@ impl NativeChatPane {
 
     pub fn set_on_title_change<F: Fn(&str) + 'static>(&self, cb: F) {
         *self.on_title_change.borrow_mut() = Some(Rc::new(cb));
+    }
+
+    pub fn set_on_preview<F: Fn(PreviewKind, String, String) + 'static>(&self, cb: F) {
+        *self.on_preview.borrow_mut() = Some(Rc::new(cb));
     }
 
     fn emit_title(&self, title: &str) {
@@ -1035,7 +1042,8 @@ impl NativeChatPane {
         card.append(&header);
 
         let body_box = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
-        render_markdown_widgets(&body_box, content);
+        let preview_cb = self.on_preview.borrow().clone();
+        render_markdown_widgets_with_preview(&body_box, content, preview_cb);
         card.append(&body_box);
 
         self.state.borrow().msg_box.append(&card);

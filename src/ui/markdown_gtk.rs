@@ -3,6 +3,10 @@ use gtk4::prelude::*;
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 use super::copy_to_clipboard;
+use crate::preview::PreviewKind;
+use std::rc::Rc;
+
+pub type PreviewCallback = Rc<dyn Fn(PreviewKind, String, String)>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MdBlock {
@@ -356,6 +360,14 @@ pub fn parse_markdown_blocks(input: &str) -> Vec<MdBlock> {
 }
 
 pub fn render_markdown_widgets(container: &gtk4::Box, content: &str) {
+    render_markdown_widgets_with_preview(container, content, None);
+}
+
+pub fn render_markdown_widgets_with_preview(
+    container: &gtk4::Box,
+    content: &str,
+    on_preview: Option<PreviewCallback>,
+) {
     for block in parse_markdown_blocks(content) {
         match block {
             MdBlock::Heading { level, pango } => {
@@ -414,7 +426,7 @@ pub fn render_markdown_widgets(container: &gtk4::Box, content: &str) {
                 container.append(&row);
             }
             MdBlock::Code { lang, code } => {
-                container.append(&build_code_card(&lang, &code));
+                container.append(&build_code_card(&lang, &code, on_preview.clone()));
             }
             MdBlock::Table { headers, rows } => {
                 container.append(&build_table_card(&headers, &rows));
@@ -429,7 +441,16 @@ pub fn render_markdown_widgets(container: &gtk4::Box, content: &str) {
     }
 }
 
-fn build_code_card(lang: &str, code: &str) -> gtk4::Box {
+fn preview_kind_for_lang(lang: &str) -> Option<PreviewKind> {
+    match lang.trim().to_ascii_lowercase().as_str() {
+        "html" | "htm" => Some(PreviewKind::Html),
+        "svg" => Some(PreviewKind::Svg),
+        "md" | "markdown" => Some(PreviewKind::Markdown),
+        _ => None,
+    }
+}
+
+fn build_code_card(lang: &str, code: &str, on_preview: Option<PreviewCallback>) -> gtk4::Box {
     let card = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     card.add_css_class("code-card");
 
@@ -440,6 +461,20 @@ fn build_code_card(lang: &str, code: &str) -> gtk4::Box {
     lang_lbl.set_hexpand(true);
     lang_lbl.set_halign(gtk4::Align::Start);
 
+    header.append(&lang_lbl);
+
+    if let (Some(kind), Some(cb)) = (preview_kind_for_lang(lang), on_preview) {
+        let preview_btn = gtk4::Button::with_label("Preview ↗");
+        preview_btn.add_css_class("flat");
+        preview_btn.add_css_class("code-copy-btn");
+        let code_clone = code.to_string();
+        let title = format!("artifact.{lang}");
+        preview_btn.connect_clicked(move |_| {
+            cb(kind, title.clone(), code_clone.clone());
+        });
+        header.append(&preview_btn);
+    }
+
     let copy_btn = gtk4::Button::with_label("Copy code");
     copy_btn.add_css_class("flat");
     copy_btn.add_css_class("code-copy-btn");
@@ -449,7 +484,6 @@ fn build_code_card(lang: &str, code: &str) -> gtk4::Box {
         btn.set_label("Copied ✓");
     });
 
-    header.append(&lang_lbl);
     header.append(&copy_btn);
 
     let scroller = gtk4::ScrolledWindow::new();

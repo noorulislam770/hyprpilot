@@ -7,7 +7,10 @@ A lightweight, Windows Copilot-style AI assistant built specifically for **Arch 
 - **Dual UI Modes (GUI + TUI)**:
   - **Lightweight Native GUI (`hyprpilot`)**: `Alt + Space` (configurable) toggles a GTK4/Libadwaita window with Native Chat and persistent WebKitGTK portals.
   - **Terminal TUI (`hyprpilot-tui`)**: `Alt + Shift + Space` (configurable) pops open a floating terminal running the fast Ratatui TUI, automatically selecting your last-used provider & model and sharing SQLite history.
-  - **Terminal Markdown (`.md`) Renderer**: Render any `.md` file directly in the terminal with ANSI colors (`hyprpilot-tui README.md` / `hyprpilot-tui --render file.md`), open a scrollable viewer (`hyprpilot-tui --view file.md`), or press `Ctrl+O` inside the TUI.
+  - **Built-in Preview Engine (`Ctrl+3`)**:
+    - GUI Preview tab renders **HTML**, **SVG**, **PDF** (page-by-page + zoom + `pdftotext` extraction), **Markdown**, **Images** (`png`, `jpg`, `webp`, `gif`), and source/text files.
+    - **Claude-Style Artifact Previews**: Any `html`, `svg`, or `markdown` fenced code block in AI replies includes a **`Preview ↗`** button to render it immediately in the Preview tab.
+    - Terminal CLI preview: `hyprpilot --preview <file>` (GUI), `hyprpilot-tui --preview <file>` (Kitty inline graphics / ANSI), `hyprpilot-tui --view <file>` (scrollable pager).
 - **Instant Hyprland Toggle (`hyprpilot-toggle`)**:
   - Defaults to `Alt + Space` (GUI) and `Alt + Shift + Space` (TUI), both configurable in Settings or `~/.config/hyprpilot/config.toml`.
   - Launches centered at **50% × 50%** of your screen on first open.
@@ -28,7 +31,7 @@ Install the required system libraries and tools:
 sudo pacman -S --needed \
   rust cargo pkgconf base-devel \
   gtk4 libadwaita webkitgtk-6.0 \
-  sqlite wl-clipboard hyprland
+  poppler sqlite wl-clipboard hyprland
 ```
 
 > **Note**: If you want to build **Native Fast Chat only** (without embedded WebKitGTK portals), `webkitgtk-6.0` can be omitted by passing `--no-default-features` to Cargo.
@@ -107,7 +110,7 @@ HyprPilot gives you two ways to connect to AI models:
 | `Alt + Shift + Space` *(default, configurable)* | Toggle HyprPilot TUI terminal (`hyprpilot-toggle --tui`) |
 | `F11` | Toggle Fullscreen |
 | `Esc` | Hide window (configurable in Settings) |
-| `Ctrl + 1` / `Ctrl + 2` | Switch between Native Chat & Web Portals |
+| `Ctrl + 1` / `Ctrl + 2` / `Ctrl + 3` | Switch between Native Chat, Web Portals & Preview Engine |
 | `Ctrl + B` or `Ctrl + \` | Toggle Claude-style Recents sidebar |
 | `Ctrl + K` | Open sidebar & search chats |
 | `Ctrl + N` | Start a new chat |

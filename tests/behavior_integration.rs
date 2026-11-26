@@ -243,6 +243,38 @@ fn chat_history_regenerate_and_markdown_pipeline() {
     assert!(stripped.contains("find . -type d"));
 }
 
+#[test]
+fn preview_engine_detects_formats_and_renders_html_and_svg() {
+    use hyprpilot::preview::{
+        detect_preview_kind, html_to_readable_markdown, parse_pdfinfo_output, wrap_svg_as_html,
+        PreviewKind,
+    };
+
+    assert_eq!(detect_preview_kind(Path::new("index.html")), PreviewKind::Html);
+    assert_eq!(detect_preview_kind(Path::new("diagram.svg")), PreviewKind::Svg);
+    assert_eq!(detect_preview_kind(Path::new("notes.md")), PreviewKind::Markdown);
+    assert_eq!(detect_preview_kind(Path::new("paper.pdf")), PreviewKind::Pdf);
+    assert_eq!(detect_preview_kind(Path::new("shot.png")), PreviewKind::Image);
+    assert_eq!(detect_preview_kind(Path::new("src/main.rs")), PreviewKind::CodeOrText);
+
+    let wrapped_svg = wrap_svg_as_html("<svg><circle cx=\"5\" cy=\"5\" r=\"4\"/></svg>");
+    assert!(wrapped_svg.contains("<!DOCTYPE html>"));
+    assert!(wrapped_svg.contains("<circle cx=\"5\" cy=\"5\" r=\"4\"/>"));
+
+    let md = html_to_readable_markdown("<h1>Hello</h1><p>World &amp; <code>rust</code></p>");
+    assert!(md.contains("# Hello"));
+    assert!(md.contains("World & `rust`"));
+
+    let ansi = render_markdown_ansi(&md, 80);
+    let stripped = strip_ansi(&ansi);
+    assert!(stripped.contains("Hello"));
+    assert!(stripped.contains("World &"));
+
+    let info = parse_pdfinfo_output("Title: Sample Report\nPages: 12\n");
+    assert_eq!(info.pages, 12);
+    assert_eq!(info.title.as_deref(), Some("Sample Report"));
+}
+
 fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();

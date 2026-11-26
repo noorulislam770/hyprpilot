@@ -12,11 +12,12 @@ use hyprpilot::hyprland::{
 use hyprpilot::storage::config::{AppConfig, socket_path};
 use hyprpilot::ui::{
     load_css,
-    window::{build_main_window, run_gui_self_test},
+    window::{build_main_window_with_preview, run_gui_self_test},
 };
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    let mut initial_preview: Option<String> = None;
     match args.get(1).map(|s| s.as_str()) {
         Some("--self-test") => {
             let app = adw::Application::builder()
@@ -31,6 +32,17 @@ fn main() -> Result<()> {
             }
             println!("GUI_SELF_TEST_OK");
             return Ok(());
+        }
+        Some("--preview") => {
+            let target = args.get(2).cloned().unwrap_or_default();
+            if target.trim().is_empty() {
+                anyhow::bail!("usage: hyprpilot --preview <file>");
+            }
+            if send_ipc_command(&format!("PREVIEW:{target}")) {
+                restore_geometry_when_mapped();
+                return Ok(());
+            }
+            initial_preview = Some(target);
         }
         Some("--install-hyprland") => {
             let cfg = AppConfig::load()?;
@@ -49,6 +61,7 @@ fn main() -> Result<()> {
                 "HyprPilot — Lightweight Copilot-style AI Assistant for Arch & Hyprland\n\n\
                  USAGE:\n  \
                    hyprpilot                     Launch or show the GUI window\n  \
+                   hyprpilot --preview <file>    Open HTML/PDF/SVG/MD/Image/Code in Preview tab\n  \
                    hyprpilot-toggle              Toggle show/hide on Hyprland (bind to hotkey)\n  \
                    hyprpilot --install-hyprland  Write ~/.config/hypr/hyprpilot.lua & .conf and reload\n  \
                    hyprpilot --hide              Hide window to background\n  \
@@ -60,7 +73,7 @@ fn main() -> Result<()> {
     }
 
     // If a background instance is already alive, show & focus it immediately.
-    if send_ipc_command("SHOW") {
+    if initial_preview.is_none() && send_ipc_command("SHOW") {
         restore_geometry_when_mapped();
         return Ok(());
     }
@@ -83,7 +96,7 @@ fn main() -> Result<()> {
             win.present();
             return;
         }
-        let win = build_main_window(app);
+        let win = build_main_window_with_preview(app, initial_preview.as_deref());
         *win_slot.borrow_mut() = Some(win.clone());
         win.present();
     });

@@ -1,5 +1,6 @@
 pub mod markdown_gtk;
 pub mod native_chat;
+pub mod preview;
 pub mod settings;
 pub mod web_portal;
 pub mod window;

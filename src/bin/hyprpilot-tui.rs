@@ -29,7 +29,11 @@ use tokio::sync::mpsc;
 use hyprpilot::ai::models::fetch_available_models;
 use hyprpilot::ai::{AiMessage, StreamEvent, stream_chat};
 use hyprpilot::markdown::{render_markdown_ansi, render_markdown_lines};
-use hyprpilot::storage::config::{AppConfig, AuthMode, tui_socket_path};
+use hyprpilot::preview::{
+    PreviewKind, detect_preview_kind, expand_user_path, extract_pdf_text,
+    html_to_readable_markdown, inspect_pdf, render_pdf_page_png,
+};
+use hyprpilot::storage::config::{AppConfig, AuthMode, state_dir, tui_socket_path};
 use hyprpilot::storage::db::{ConversationSummary, HistoryDb, derive_title_from_prompt};
 
 // ---------------------------------------------------------------------------
@@ -846,7 +850,7 @@ impl TuiClient {
     }
 
     fn open_markdown_picker(&mut self) {
-        let mut files = discover_markdown_files();
+        let mut files = discover_previewable_files();
         files.sort();
         let mut list_state = ListState::default();
         if !files.is_empty() {
@@ -860,13 +864,12 @@ impl TuiClient {
     }
 
     fn open_markdown_viewer(&mut self, path_str: &str) {
-        let expanded = expand_tilde(path_str.trim());
-        match fs::read_to_string(&expanded) {
-            Ok(content) => {
-                let width = crossterm::terminal::size()
-                    .map(|(w, _)| w.saturating_sub(8) as usize)
-                    .unwrap_or(90);
-                let lines = render_markdown_lines(&content, None, width);
+        let expanded = expand_user_path(path_str);
+        let width = crossterm::terminal::size()
+            .map(|(w, _)| w.saturating_sub(8) as usize)
+            .unwrap_or(90);
+        match load_preview_lines_for_tui(&expanded, width) {
+            Ok(lines) => {
                 self.modal = Modal::MarkdownViewer {
                     title: format!(" {} (Up/Down/PgUp/PgDn, Esc: Back) ", expanded.display()),
                     lines,
@@ -875,7 +878,7 @@ impl TuiClient {
             }
             Err(e) => {
                 self.modal = Modal::None;
-                self.local_notice = Some(format!("Failed to read {}: {e}", expanded.display()));
+                self.local_notice = Some(format!("Preview failed for {}: {e:#}", expanded.display()));
             }
         }
     }
@@ -1510,14 +1513,18 @@ fn run_oneshot(prompt: String) -> Result<()> {
     Ok(())
 }
 
-fn discover_markdown_files() -> Vec<String> {
+fn discover_previewable_files() -> Vec<String> {
     let mut out = Vec::new();
     if let Ok(entries) = fs::read_dir(".") {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_file() {
                 if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                    if ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown") {
+                    let e = ext.to_ascii_lowercase();
+                    if matches!(
+                        e.as_str(),
+                        "md" | "markdown" | "html" | "htm" | "pdf" | "svg" | "txt" | "json" | "toml"
+                    ) {
                         if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                             out.push(name.to_string());
                         }
@@ -1529,28 +1536,58 @@ fn discover_markdown_files() -> Vec<String> {
     out
 }
 
-fn expand_tilde(raw: &str) -> std::path::PathBuf {
-    if let Some(rest) = raw.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
+fn load_preview_lines_for_tui(path: &std::path::Path, width: usize) -> Result<Vec<Line<'static>>> {
+    let kind = detect_preview_kind(path);
+    let md_content = match kind {
+        PreviewKind::Markdown => fs::read_to_string(path)?,
+        PreviewKind::Html => html_to_readable_markdown(&fs::read_to_string(path)?),
+        PreviewKind::Pdf => {
+            let info = inspect_pdf(path)?;
+            let text = extract_pdf_text(path, None)?;
+            let title = info.title.unwrap_or_else(|| path.display().to_string());
+            format!("# {title}\n\n*PDF — {} page(s)*\n\n---\n\n{text}", info.pages)
         }
-    }
-    std::path::PathBuf::from(raw)
+        PreviewKind::Image => {
+            format!("# Image Preview\n\nPath: `{}`\n\nRun `hyprpilot --preview {}` for GUI or `hyprpilot-tui --preview {}` in kitty for inline graphics.", path.display(), path.display(), path.display())
+        }
+        PreviewKind::Svg | PreviewKind::CodeOrText => {
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("txt");
+            let body = fs::read_to_string(path)?;
+            format!("```{ext}\n{body}\n```")
+        }
+    };
+    Ok(render_markdown_lines(&md_content, None, width))
 }
 
-fn read_markdown_input(target: &str) -> Result<String> {
+fn read_stdin_or_path_markdown(target: &str) -> Result<String> {
     if target == "-" {
         use std::io::Read;
         let mut buf = String::new();
         io::stdin().read_to_string(&mut buf)?;
         return Ok(buf);
     }
-    let path = expand_tilde(target);
-    fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))
+    let path = expand_user_path(target);
+    let kind = detect_preview_kind(&path);
+    match kind {
+        PreviewKind::Html => Ok(html_to_readable_markdown(&fs::read_to_string(&path)?)),
+        PreviewKind::Pdf => {
+            let info = inspect_pdf(&path)?;
+            let text = extract_pdf_text(&path, None)?;
+            let title = info.title.unwrap_or_else(|| path.display().to_string());
+            Ok(format!("# {title}\n\n*PDF — {} page(s)*\n\n---\n\n{text}", info.pages))
+        }
+        PreviewKind::Markdown => Ok(fs::read_to_string(&path)?),
+        PreviewKind::Image => Ok(format!("Image: `{}` (use `--preview` in Kitty or GUI)", path.display())),
+        PreviewKind::Svg | PreviewKind::CodeOrText => {
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("txt");
+            let body = fs::read_to_string(&path)?;
+            Ok(format!("```{ext}\n{body}\n```"))
+        }
+    }
 }
 
-fn render_md_stdout(target: &str) -> Result<()> {
-    let content = read_markdown_input(target)?;
+fn render_file_stdout(target: &str) -> Result<()> {
+    let content = read_stdin_or_path_markdown(target)?;
     let width = crossterm::terminal::size()
         .map(|(w, _)| w as usize)
         .unwrap_or(100);
@@ -1559,8 +1596,38 @@ fn render_md_stdout(target: &str) -> Result<()> {
     Ok(())
 }
 
-fn run_md_viewer(target: &str) -> Result<()> {
-    let content = read_markdown_input(target)?;
+fn preview_file_terminal(target: &str) -> Result<()> {
+    let path = expand_user_path(target);
+    let kind = detect_preview_kind(&path);
+    let is_kitty = std::env::var("TERM").is_ok_and(|t| t.contains("kitty"));
+    if is_kitty && kind == PreviewKind::Image {
+        let status = Command::new("kitty")
+            .args(["+kitten", "icat"])
+            .arg(&path)
+            .status();
+        if status.is_ok_and(|s| s.success()) {
+            return Ok(());
+        }
+    }
+    if is_kitty && kind == PreviewKind::Pdf {
+        let info = inspect_pdf(&path)?;
+        println!("PDF: {} ({} page(s))", path.display(), info.pages);
+        let cache = state_dir().join("pdf-preview");
+        if let Ok(png) = render_pdf_page_png(&path, 1, 140, &cache) {
+            let status = Command::new("kitty")
+                .args(["+kitten", "icat"])
+                .arg(&png)
+                .status();
+            if status.is_ok_and(|s| s.success()) {
+                return Ok(());
+            }
+        }
+    }
+    render_file_stdout(target)
+}
+
+fn run_file_viewer(target: &str) -> Result<()> {
+    let content = read_stdin_or_path_markdown(target)?;
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -1627,20 +1694,25 @@ fn main() -> Result<()> {
                 return Ok(());
             }
             "--render" => {
-                let target = args.get(1).context("usage: hyprpilot-tui --render <file.md | ->")?;
-                return render_md_stdout(target);
+                let target = args.get(1).context("usage: hyprpilot-tui --render <file | ->")?;
+                return render_file_stdout(target);
+            }
+            "--preview" => {
+                let target = args.get(1).context("usage: hyprpilot-tui --preview <file>")?;
+                return preview_file_terminal(target);
             }
             "--view" => {
-                let target = args.get(1).context("usage: hyprpilot-tui --view <file.md | ->")?;
-                return run_md_viewer(target);
+                let target = args.get(1).context("usage: hyprpilot-tui --view <file | ->")?;
+                return run_file_viewer(target);
             }
             "--help" | "-h" => {
                 println!(
-                    "HyprPilot TUI — Persistent Background Terminal AI Assistant & Markdown Viewer\n\n\
+                    "HyprPilot TUI — Persistent Background Terminal AI Assistant & Preview Engine\n\n\
                      USAGE:\n  \
                        hyprpilot-tui                   Attach to persistent TUI session (auto-starts daemon)\n  \
-                       hyprpilot-tui --render <file>   Render a Markdown (.md) file with ANSI colors to stdout\n  \
-                       hyprpilot-tui --view <file>     Open a Markdown (.md) file in the scrollable TUI pager\n  \
+                       hyprpilot-tui --render <file>   Render Markdown/HTML/PDF text with ANSI colors to stdout\n  \
+                       hyprpilot-tui --preview <file>  Preview file in terminal (Kitty icat for PDF/images)\n  \
+                       hyprpilot-tui --view <file>     Open .md/.html/.pdf/.txt in scrollable TUI pager\n  \
                        hyprpilot-tui <file.md>         Render existing .md file to stdout\n  \
                        hyprpilot-tui <prompt...>       Stream a single AI answer to stdout\n  \
                        hyprpilot-tui --daemon          Run background TUI session daemon\n  \
@@ -1651,9 +1723,9 @@ fn main() -> Result<()> {
             }
             path if args.len() == 1
                 && (path.ends_with(".md") || path.ends_with(".markdown"))
-                && expand_tilde(path).is_file() =>
+                && expand_user_path(path).is_file() =>
             {
-                return render_md_stdout(path);
+                return render_file_stdout(path);
             }
             _ => return run_oneshot(args.join(" ")),
         }

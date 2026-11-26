@@ -1,6 +1,7 @@
 pub mod ai;
 pub mod hyprland;
 pub mod markdown;
+pub mod preview;
 pub mod storage;
 pub mod ui;
 

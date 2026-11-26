@@ -10,17 +10,30 @@ use std::rc::Rc;
 use tokio::sync::mpsc;
 
 use super::native_chat::NativeChatPane;
+use super::preview::PreviewPane;
 use super::settings::show_settings_dialog;
 use super::web_portal::WebPortalPane;
 use crate::APP_NAME;
 use crate::hyprland::snapshot_and_save_geometry;
+use crate::preview::expand_user_path;
 use crate::storage::config::{AppConfig, socket_path};
 
 pub fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
-    build_main_window_inner(app, true)
+    build_main_window_inner(app, true, None)
 }
 
-fn build_main_window_inner(app: &adw::Application, enable_ipc: bool) -> adw::ApplicationWindow {
+pub fn build_main_window_with_preview(
+    app: &adw::Application,
+    initial_preview: Option<&str>,
+) -> adw::ApplicationWindow {
+    build_main_window_inner(app, true, initial_preview)
+}
+
+fn build_main_window_inner(
+    app: &adw::Application,
+    enable_ipc: bool,
+    initial_preview: Option<&str>,
+) -> adw::ApplicationWindow {
     let config = Rc::new(RefCell::new(AppConfig::load().unwrap_or_default()));
     let runtime = Rc::new(
         tokio::runtime::Builder::new_multi_thread()
@@ -40,12 +53,15 @@ fn build_main_window_inner(app: &adw::Application, enable_ipc: bool) -> adw::App
 
     let native_pane = NativeChatPane::new(config.clone(), runtime.clone());
     let portal_pane = Rc::new(WebPortalPane::new(config.clone()));
+    let preview_pane = Rc::new(PreviewPane::new(Some(window.clone().upcast())));
 
     let view_stack = adw::ViewStack::new();
     let native_page = view_stack.add_titled(&native_pane.root, Some("native"), "Chat");
     native_page.set_icon_name(Some("chat-message-new-symbolic"));
     let portal_page = view_stack.add_titled(&portal_pane.root, Some("portal"), "Web Portals");
     portal_page.set_icon_name(Some("web-browser-symbolic"));
+    let preview_page = view_stack.add_titled(&preview_pane.root, Some("preview"), "Preview");
+    preview_page.set_icon_name(Some("document-open-symbolic"));
 
     // Claude-style OverlaySplitView: collapsible sidebar on left, view_stack on right
     let split = adw::OverlaySplitView::new();
@@ -67,12 +83,17 @@ fn build_main_window_inner(app: &adw::Application, enable_ipc: bool) -> adw::App
     nav_portal_btn.add_css_class("flat");
     nav_portal_btn.add_css_class("claude-nav-pill");
 
+    let nav_preview_btn = gtk4::ToggleButton::with_label("Preview Engine  (Ctrl+3)");
+    nav_preview_btn.add_css_class("flat");
+    nav_preview_btn.add_css_class("claude-nav-pill");
+
     let sidebar_settings_btn = gtk4::Button::with_label("Settings  (Ctrl+,)");
     sidebar_settings_btn.add_css_class("flat");
     sidebar_settings_btn.add_css_class("claude-nav-pill");
 
     footer_box.append(&nav_chat_btn);
     footer_box.append(&nav_portal_btn);
+    footer_box.append(&nav_preview_btn);
     footer_box.append(&sidebar_settings_btn);
     sidebar_box.append(&footer_box);
 
@@ -121,13 +142,28 @@ fn build_main_window_inner(app: &adw::Application, enable_ipc: bool) -> adw::App
     split.set_content(Some(&main_toolbar));
     window.set_content(Some(&split));
 
-    if config.borrow().default_view == "portal" {
+    if let Some(path_str) = initial_preview {
+        preview_pane.open_file(&expand_user_path(path_str));
+        view_stack.set_visible_child_name("preview");
+        nav_preview_btn.set_active(true);
+        chat_title_lbl.set_text("Preview");
+    } else if config.borrow().default_view == "portal" {
         view_stack.set_visible_child_name("portal");
         nav_portal_btn.set_active(true);
         portal_pane.ensure_active_loaded();
     } else {
         view_stack.set_visible_child_name("native");
         nav_chat_btn.set_active(true);
+    }
+
+    // Wire Claude-style Artifact "Preview ↗" button inside chat code blocks
+    {
+        let pp = preview_pane.clone();
+        let vs = view_stack.clone();
+        native_pane.set_on_preview(move |kind, title, code| {
+            pp.preview_inline(kind, &title, &code);
+            vs.set_visible_child_name("preview");
+        });
     }
 
     // Update header title when active chat changes
@@ -167,6 +203,14 @@ fn build_main_window_inner(app: &adw::Application, enable_ipc: bool) -> adw::App
             }
         });
     }
+    {
+        let vs = view_stack.clone();
+        nav_preview_btn.connect_clicked(move |b| {
+            if b.is_active() {
+                vs.set_visible_child_name("preview");
+            }
+        });
+    }
 
     // Lazy-load WebKit only when switching to Web Portals & sync sidebar pills
     {
@@ -174,22 +218,36 @@ fn build_main_window_inner(app: &adw::Application, enable_ipc: bool) -> adw::App
         let np = native_pane.clone();
         let nc = nav_chat_btn.clone();
         let npb = nav_portal_btn.clone();
+        let npr = nav_preview_btn.clone();
         let title_lbl = chat_title_lbl.clone();
         view_stack.connect_visible_child_name_notify(move |vs| {
-            let is_portal = vs.visible_child_name().as_deref() == Some("portal");
-            nc.set_active(!is_portal);
-            npb.set_active(is_portal);
-            if is_portal {
-                title_lbl.set_text("Web Portals");
-                pp.ensure_active_loaded();
-            } else {
-                np.focus_input();
+            let name = vs.visible_child_name();
+            let active = name.as_deref().unwrap_or("native");
+            nc.set_active(active == "native");
+            npb.set_active(active == "portal");
+            npr.set_active(active == "preview");
+            match active {
+                "portal" => {
+                    title_lbl.set_text("Web Portals");
+                    pp.ensure_active_loaded();
+                }
+                "preview" => {
+                    title_lbl.set_text("Preview Engine");
+                }
+                _ => {
+                    np.focus_input();
+                }
             }
         });
     }
 
     if enable_ipc {
-        start_ipc_server(window.clone(), app.clone());
+        start_ipc_server(
+            window.clone(),
+            app.clone(),
+            preview_pane.clone(),
+            view_stack.clone(),
+        );
     }
 
     // Clicking window close button hides to background rather than exiting
@@ -276,6 +334,10 @@ fn build_main_window_inner(app: &adw::Application, enable_ipc: bool) -> adw::App
                         vs.set_visible_child_name("portal");
                         return gtk4::glib::Propagation::Stop;
                     }
+                    gdk::Key::_3 => {
+                        vs.set_visible_child_name("preview");
+                        return gtk4::glib::Propagation::Stop;
+                    }
                     gdk::Key::b | gdk::Key::B | gdk::Key::backslash => {
                         sp.set_show_sidebar(!sp.shows_sidebar());
                         return gtk4::glib::Propagation::Stop;
@@ -341,7 +403,12 @@ fn quit_app(app: &adw::Application) {
     app.quit();
 }
 
-fn start_ipc_server(win: adw::ApplicationWindow, app: adw::Application) {
+fn start_ipc_server(
+    win: adw::ApplicationWindow,
+    app: adw::Application,
+    preview_pane: Rc<PreviewPane>,
+    view_stack: adw::ViewStack,
+) {
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
     let sock = socket_path();
     if let Some(parent) = sock.parent() {
@@ -362,7 +429,7 @@ fn start_ipc_server(win: adw::ApplicationWindow, app: adw::Application) {
             let mut reader = BufReader::new(stream);
             let mut line = String::new();
             if reader.read_line(&mut line).is_ok() {
-                let cmd = line.trim().to_uppercase();
+                let cmd = line.trim().to_string();
                 if !cmd.is_empty() {
                     let _ = tx.send(cmd);
                 }
@@ -372,7 +439,14 @@ fn start_ipc_server(win: adw::ApplicationWindow, app: adw::Application) {
 
     gtk4::glib::MainContext::default().spawn_local(async move {
         while let Some(cmd) = rx.recv().await {
-            match cmd.as_str() {
+            if let Some(raw_path) = cmd.strip_prefix("PREVIEW:") {
+                preview_pane.open_file(&expand_user_path(raw_path));
+                view_stack.set_visible_child_name("preview");
+                win.set_visible(true);
+                win.present();
+                continue;
+            }
+            match cmd.to_ascii_uppercase().as_str() {
                 "SHOW" => {
                     win.set_visible(true);
                     win.present();
@@ -407,8 +481,11 @@ pub fn run_gui_self_test(app: &adw::Application) {
             .expect("tokio runtime"),
     );
 
-    let win = build_main_window_inner(app, false);
+    let win = build_main_window_inner(app, false, None);
     assert_eq!(win.title().as_deref(), Some(APP_NAME));
+
+    let preview = PreviewPane::new(Some(win.clone().upcast()));
+    preview.self_test_preview();
 
     // Exercise SplitView sidebar toggle & NativeChatPane Markdown rendering + reset
     let split = win
