@@ -152,7 +152,67 @@ fn find_hyprpilot_client() -> Result<Option<HyprClient>> {
     find_client_by_class(APP_ID, Some(APP_NAME))
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct HyprMonitor {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    #[serde(default)]
+    focused: bool,
+}
+
+fn fetch_monitors() -> Vec<HyprMonitor> {
+    let Ok(raw) = run_hyprctl(&["-j", "monitors"]) else {
+        return Vec::new();
+    };
+    serde_json::from_str(&raw).unwrap_or_default()
+}
+
+pub fn clamp_geometry_to_monitor_bounds(
+    geom: &SavedGeometry,
+    monitors: &[(i32, i32, i32, i32, bool)],
+) -> SavedGeometry {
+    if monitors.is_empty() {
+        return geom.clone();
+    }
+    let cx = geom.x + geom.width / 2;
+    let cy = geom.y + geom.height / 2;
+    let target = monitors
+        .iter()
+        .find(|&&(mx, my, mw, mh, _)| cx >= mx && cx < mx + mw && cy >= my && cy < my + mh)
+        .or_else(|| monitors.iter().find(|&&(_, _, _, _, f)| f))
+        .unwrap_or(&monitors[0]);
+
+    let (mx, my, mw, mh, _) = *target;
+    let w = geom.width.min((mw - 24).max(360)).max(360);
+    let h = geom.height.min((mh - 24).max(300)).max(300);
+    let on_target = cx >= mx && cx < mx + mw && cy >= my && cy < my + mh;
+    let (x, y) = if on_target {
+        (
+            geom.x.clamp(mx, mx + (mw - w).max(0)),
+            geom.y.clamp(my, my + (mh - h).max(0)),
+        )
+    } else {
+        (mx + (mw - w) / 2, my + (mh - h) / 2)
+    };
+    SavedGeometry {
+        x,
+        y,
+        width: w,
+        height: h,
+        fullscreen: geom.fullscreen,
+        font_size: geom.font_size,
+        cell_height_px: geom.cell_height_px,
+    }
+}
+
 fn apply_geometry_to_address(address: &str, geom: &SavedGeometry) {
+    let monitors: Vec<(i32, i32, i32, i32, bool)> = fetch_monitors()
+        .into_iter()
+        .map(|m| (m.x, m.y, m.width, m.height, m.focused))
+        .collect();
+    let geom = clamp_geometry_to_monitor_bounds(geom, &monitors);
     if is_lua_config() {
         let resize_cmd = format!(
             "hl.dsp.window.resize({{ x = {}, y = {}, relative = false, window = \"address:{address}\" }})",
@@ -651,5 +711,24 @@ mod tests {
         // Resized window without zooming keeps same cell height -> same font size
         let resized_only = compute_zoomed_font_size(9.5, 14.21, 14.21);
         assert_eq!(resized_only, 9.5);
+    }
+
+    #[test]
+    fn clamps_offscreen_geometry_to_focused_monitor() {
+        // Off-screen saved bounds (e.g. unplugged monitor at 2511,69) when eDP-1 is at 2849,1080 (1920x1080)
+        let saved = SavedGeometry {
+            x: 2511,
+            y: 69,
+            width: 960,
+            height: 540,
+            fullscreen: false,
+            font_size: None,
+            cell_height_px: None,
+        };
+        let monitors = [(2849, 1080, 1920, 1080, true)];
+        let clamped = clamp_geometry_to_monitor_bounds(&saved, &monitors);
+        // Should center inside eDP-1: x = 2849 + (1920-960)/2 = 3329, y = 1080 + (1080-540)/2 = 1350
+        assert_eq!(clamped.x, 3329);
+        assert_eq!(clamped.y, 1350);
     }
 }
