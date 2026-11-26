@@ -25,6 +25,7 @@ use tokio::sync::mpsc;
 
 use hyprpilot::ai::models::fetch_available_models;
 use hyprpilot::ai::{AiMessage, StreamEvent, stream_chat};
+use hyprpilot::markdown::{render_markdown_ansi, render_markdown_lines};
 use hyprpilot::storage::config::{AppConfig, AuthMode, tui_socket_path};
 use hyprpilot::storage::db::{ConversationSummary, HistoryDb, derive_title_from_prompt};
 
@@ -589,6 +590,16 @@ enum Modal {
     Provider(ListState),
     Model(ListState),
     History(ListState),
+    MarkdownPicker {
+        files: Vec<String>,
+        list_state: ListState,
+        path_input: String,
+    },
+    MarkdownViewer {
+        title: String,
+        lines: Vec<Line<'static>>,
+        scroll: u16,
+    },
 }
 
 struct TerminalGuard;
@@ -732,6 +743,7 @@ impl TuiClient {
                 KeyCode::Char('p') => self.open_provider_modal(),
                 KeyCode::Char('m') => self.open_model_modal(),
                 KeyCode::Char('g') => self.open_history_modal(),
+                KeyCode::Char('o') => self.open_markdown_picker(),
                 KeyCode::Char('r') => self.send_cmd(&ClientCmd::FetchModels),
                 KeyCode::Char('n') => {
                     self.scroll_offset = 0;
@@ -830,7 +842,110 @@ impl TuiClient {
         self.modal = Modal::History(st);
     }
 
+    fn open_markdown_picker(&mut self) {
+        let mut files = discover_markdown_files();
+        files.sort();
+        let mut list_state = ListState::default();
+        if !files.is_empty() {
+            list_state.select(Some(0));
+        }
+        self.modal = Modal::MarkdownPicker {
+            files,
+            list_state,
+            path_input: String::new(),
+        };
+    }
+
+    fn open_markdown_viewer(&mut self, path_str: &str) {
+        let expanded = expand_tilde(path_str.trim());
+        match fs::read_to_string(&expanded) {
+            Ok(content) => {
+                let width = crossterm::terminal::size()
+                    .map(|(w, _)| w.saturating_sub(8) as usize)
+                    .unwrap_or(90);
+                let lines = render_markdown_lines(&content, None, width);
+                self.modal = Modal::MarkdownViewer {
+                    title: format!(" {} (Up/Down/PgUp/PgDn, Esc: Back) ", expanded.display()),
+                    lines,
+                    scroll: 0,
+                };
+            }
+            Err(e) => {
+                self.modal = Modal::None;
+                self.local_notice = Some(format!("Failed to read {}: {e}", expanded.display()));
+            }
+        }
+    }
+
     fn handle_modal_key(&mut self, code: KeyCode) {
+        if let Modal::MarkdownViewer { lines, scroll, .. } = &mut self.modal {
+            let max_s = (lines.len() as u16).saturating_sub(10);
+            match code {
+                KeyCode::Esc | KeyCode::Char('q') => self.modal = Modal::None,
+                KeyCode::Up | KeyCode::Char('k') => *scroll = scroll.saturating_sub(2),
+                KeyCode::Down | KeyCode::Char('j') => *scroll = (*scroll + 2).min(max_s),
+                KeyCode::PageUp => *scroll = scroll.saturating_sub(15),
+                KeyCode::PageDown => *scroll = (*scroll + 15).min(max_s),
+                KeyCode::Home | KeyCode::Char('g') => *scroll = 0,
+                KeyCode::End | KeyCode::Char('G') => *scroll = max_s,
+                _ => {}
+            }
+            return;
+        }
+
+        if let Modal::MarkdownPicker {
+            files,
+            list_state,
+            path_input,
+        } = &mut self.modal
+        {
+            match code {
+                KeyCode::Esc => {
+                    self.modal = Modal::None;
+                    return;
+                }
+                KeyCode::Up if path_input.is_empty() => {
+                    if !files.is_empty() {
+                        let next = list_state.selected().map(|i| i.saturating_sub(1)).unwrap_or(0);
+                        list_state.select(Some(next));
+                    }
+                    return;
+                }
+                KeyCode::Down if path_input.is_empty() => {
+                    if !files.is_empty() {
+                        let next = list_state
+                            .selected()
+                            .map(|i| (i + 1).min(files.len() - 1))
+                            .unwrap_or(0);
+                        list_state.select(Some(next));
+                    }
+                    return;
+                }
+                KeyCode::Backspace => {
+                    path_input.pop();
+                    return;
+                }
+                KeyCode::Enter => {
+                    let chosen = if !path_input.trim().is_empty() {
+                        path_input.trim().to_string()
+                    } else if let Some(idx) = list_state.selected() {
+                        files.get(idx).cloned().unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+                    if !chosen.is_empty() {
+                        self.open_markdown_viewer(&chosen);
+                    }
+                    return;
+                }
+                KeyCode::Char(c) => {
+                    path_input.push(c);
+                    return;
+                }
+                _ => return,
+            }
+        }
+
         match code {
             KeyCode::Esc => {
                 self.modal = Modal::None;
@@ -885,23 +1000,27 @@ impl TuiClient {
                     }
                 }
             }
-            Modal::None => {}
+            Modal::None | Modal::MarkdownPicker { .. } | Modal::MarkdownViewer { .. } => {}
         }
     }
 
     fn modal_len(&self) -> usize {
         match &self.modal {
-            Modal::None => 0,
+            Modal::None | Modal::MarkdownViewer { .. } => 0,
             Modal::Provider(_) => self.snap.providers.len(),
             Modal::Model(_) => self.snap.models.len(),
             Modal::History(_) => self.snap.history.len(),
+            Modal::MarkdownPicker { files, .. } => files.len(),
         }
     }
 
     fn modal_state_mut(&mut self) -> Option<&mut ListState> {
         match &mut self.modal {
-            Modal::None => None,
-            Modal::Provider(s) | Modal::Model(s) | Modal::History(s) => Some(s),
+            Modal::None | Modal::MarkdownViewer { .. } => None,
+            Modal::Provider(s)
+            | Modal::Model(s)
+            | Modal::History(s)
+            | Modal::MarkdownPicker { list_state: s, .. } => Some(s),
         }
     }
 
@@ -986,6 +1105,7 @@ impl TuiClient {
         frame.render_widget(header, chunks[0]);
 
         // Colorful Chat Transcript
+        let inner_width = chunks[1].width.saturating_sub(6).max(30) as usize;
         let mut lines: Vec<Line<'static>> = Vec::new();
         if self.snap.messages.is_empty() && !self.snap.streaming {
             lines.push(Line::from(""));
@@ -999,7 +1119,7 @@ impl TuiClient {
                 ),
             ]));
             lines.push(Line::from(Span::styled(
-                "    Try: \"how to find a directory inside linux\"   (or Ctrl+G for past chats)",
+                "    Try: \"how to find a directory inside linux\"  |  Ctrl+O: Open .md  |  Ctrl+G: History",
                 Style::default().fg(Color::DarkGray),
             )));
         } else {
@@ -1010,6 +1130,7 @@ impl TuiClient {
                     &m.content,
                     &self.snap.model,
                     false,
+                    inner_width,
                 );
             }
             if self.snap.streaming {
@@ -1018,7 +1139,14 @@ impl TuiClient {
                 } else {
                     self.snap.streaming_reply.clone()
                 };
-                render_styled_message(&mut lines, "assistant", &text, &self.snap.model, true);
+                render_styled_message(
+                    &mut lines,
+                    "assistant",
+                    &text,
+                    &self.snap.model,
+                    true,
+                    inner_width,
+                );
             }
         }
 
@@ -1083,11 +1211,10 @@ impl TuiClient {
         let footer = Paragraph::new(Line::from(vec![
             key_chip("Ctrl+P", "Provider"),
             key_chip("Ctrl+M", "Model"),
-            key_chip("Ctrl+R", "Fetch"),
+            key_chip("Ctrl+O", "Open.md"),
             key_chip("Ctrl+G/F4", "History"),
             key_chip("Ctrl+N", "New"),
             key_chip("Ctrl+Y", "Copy"),
-            key_chip("Ctrl+L", "Linux"),
             key_chip("Esc", "Hide"),
         ]));
         frame.render_widget(footer, chunks[3]);
@@ -1147,6 +1274,76 @@ impl TuiClient {
                     .collect();
                 render_modal_list(frame, " Chat History (Enter / Esc) ", items, st);
             }
+            Modal::MarkdownPicker {
+                files,
+                list_state,
+                path_input,
+            } => {
+                let area = centered_rect(76, 65, frame.area());
+                frame.render_widget(Clear, area);
+                let parts = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(3), Constraint::Min(4)])
+                    .split(area);
+                let path_box = Paragraph::new(format!(" Path: {}█", path_input)).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(Color::LightCyan))
+                        .title(" Open .md File (Type path or pick below, Enter / Esc) "),
+                );
+                frame.render_widget(path_box, parts[0]);
+                let items: Vec<ListItem<'_>> = if files.is_empty() {
+                    vec![ListItem::new(Span::styled(
+                        "No .md files in current directory — type a file path above",
+                        Style::default().fg(Color::DarkGray),
+                    ))]
+                } else {
+                    files
+                        .iter()
+                        .map(|f| ListItem::new(Span::styled(f.clone(), Style::default().fg(Color::LightYellow))))
+                        .collect()
+                };
+                let list = List::new(items)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .border_style(Style::default().fg(Color::LightMagenta)),
+                    )
+                    .highlight_style(
+                        Style::default()
+                            .bg(Color::Rgb(46, 76, 130))
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                    .highlight_symbol("▶ ");
+                frame.render_stateful_widget(list, parts[1], list_state);
+            }
+            Modal::MarkdownViewer {
+                title,
+                lines,
+                scroll,
+            } => {
+                let area = centered_rect(92, 88, frame.area());
+                frame.render_widget(Clear, area);
+                let viewer = Paragraph::new(lines.clone())
+                    .wrap(Wrap { trim: false })
+                    .scroll((*scroll, 0))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .border_style(Style::default().fg(Color::LightMagenta))
+                            .title(Span::styled(
+                                title.as_str(),
+                                Style::default()
+                                    .fg(Color::LightCyan)
+                                    .add_modifier(Modifier::BOLD),
+                            )),
+                    );
+                frame.render_widget(viewer, area);
+            }
         }
     }
 }
@@ -1164,16 +1361,15 @@ fn render_styled_message(
     content: &str,
     model_name: &str,
     is_streaming: bool,
+    max_width: usize,
 ) {
     if role == "user" {
-        out.push(Line::from(vec![
-            Span::styled(
-                " ╭─ ❯ You ",
-                Style::default()
-                    .fg(Color::LightCyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]));
+        out.push(Line::from(Span::styled(
+            " ╭─ ❯ You ",
+            Style::default()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+        )));
         for line in content.lines() {
             out.push(Line::from(vec![
                 Span::styled(" │ ", Style::default().fg(Color::Cyan)),
@@ -1200,158 +1396,14 @@ fn render_styled_message(
             .add_modifier(Modifier::BOLD),
     )));
 
-    let mut in_code = false;
-    for raw_line in content.lines() {
-        let trimmed = raw_line.trim_start();
-        if let Some(rest) = trimmed.strip_prefix("```") {
-            if !in_code {
-                in_code = true;
-                let code_lang = rest.trim();
-                let lang_tag = if code_lang.is_empty() { "code" } else { code_lang };
-                out.push(Line::from(vec![
-                    Span::styled(" │ ", Style::default().fg(Color::Magenta)),
-                    Span::styled(
-                        format!("┌─ {lang_tag} ────────────"),
-                        Style::default()
-                            .fg(Color::LightBlue)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ]));
-            } else {
-                in_code = false;
-                out.push(Line::from(vec![
-                    Span::styled(" │ ", Style::default().fg(Color::Magenta)),
-                    Span::styled("└────────────────────", Style::default().fg(Color::LightBlue)),
-                ]));
-            }
-            continue;
-        }
-
-        if in_code {
-            out.push(highlight_code_line(raw_line));
-        } else {
-            out.push(highlight_markdown_line(raw_line));
-        }
-    }
-
-    if in_code {
-        out.push(Line::from(vec![
-            Span::styled(" │ ", Style::default().fg(Color::Magenta)),
-            Span::styled("└────────────────────", Style::default().fg(Color::LightBlue)),
-        ]));
-    }
+    let bar = Span::styled(" │ ", Style::default().fg(Color::Magenta));
+    out.extend(render_markdown_lines(content, Some(bar), max_width));
 
     out.push(Line::from(Span::styled(
         " ╰──",
         Style::default().fg(Color::Magenta),
     )));
     out.push(Line::from(""));
-}
-
-fn highlight_code_line(line: &str) -> Line<'static> {
-    let mut spans = vec![
-        Span::styled(" │ ", Style::default().fg(Color::Magenta)),
-        Span::styled("│ ", Style::default().fg(Color::LightBlue)),
-    ];
-    let trimmed = line.trim_start();
-    if trimmed.starts_with('#') || trimmed.starts_with("//") {
-        spans.push(Span::styled(
-            line.to_string(),
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::ITALIC),
-        ));
-    } else {
-        // Simple token coloring for shell/code readability
-        for (idx, tok) in line.split_inclusive(' ').enumerate() {
-            let color = if idx == 0 && !tok.trim().starts_with('-') {
-                Color::LightGreen
-            } else if tok.trim_start().starts_with('-') {
-                Color::LightCyan
-            } else if tok.contains('"') || tok.contains('\'') {
-                Color::LightYellow
-            } else {
-                Color::Rgb(220, 230, 245)
-            };
-            spans.push(Span::styled(tok.to_string(), Style::default().fg(color)));
-        }
-    }
-    Line::from(spans)
-}
-
-fn highlight_markdown_line(line: &str) -> Line<'static> {
-    let mut spans = vec![Span::styled(" │ ", Style::default().fg(Color::Magenta))];
-    let trimmed = line.trim_start();
-    if trimmed.starts_with('#') {
-        spans.push(Span::styled(
-            trimmed.trim_start_matches('#').trim().to_string(),
-            Style::default()
-                .fg(Color::LightBlue)
-                .add_modifier(Modifier::BOLD),
-        ));
-        return Line::from(spans);
-    }
-
-    let body = if let Some(rest) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* "))
-    {
-        spans.push(Span::styled("• ", Style::default().fg(Color::LightMagenta)));
-        rest
-    } else {
-        line
-    };
-
-    // Highlight inline `code` and **bold** spans
-    let mut i = 0;
-    let bytes = body.as_bytes();
-    let mut normal_start = 0;
-    while i < bytes.len() {
-        if body[i..].starts_with('`') {
-            if let Some(end) = body[i + 1..].find('`') {
-                if i > normal_start {
-                    spans.push(Span::styled(
-                        body[normal_start..i].to_string(),
-                        Style::default().fg(Color::Rgb(230, 235, 245)),
-                    ));
-                }
-                let code_txt = &body[i + 1..i + 1 + end];
-                spans.push(Span::styled(
-                    format!(" {code_txt} "),
-                    Style::default()
-                        .bg(Color::Rgb(42, 48, 62))
-                        .fg(Color::LightYellow),
-                ));
-                i = i + 1 + end + 1;
-                normal_start = i;
-                continue;
-            }
-        } else if body[i..].starts_with("**") {
-            if let Some(end) = body[i + 2..].find("**") {
-                if i > normal_start {
-                    spans.push(Span::styled(
-                        body[normal_start..i].to_string(),
-                        Style::default().fg(Color::Rgb(230, 235, 245)),
-                    ));
-                }
-                spans.push(Span::styled(
-                    body[i + 2..i + 2 + end].to_string(),
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                ));
-                i = i + 2 + end + 2;
-                normal_start = i;
-                continue;
-            }
-        }
-        i += body[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
-    }
-    if normal_start < body.len() {
-        spans.push(Span::styled(
-            body[normal_start..].to_string(),
-            Style::default().fg(Color::Rgb(230, 235, 245)),
-        ));
-    }
-    Line::from(spans)
 }
 
 fn render_modal_list(
@@ -1455,6 +1507,110 @@ fn run_oneshot(prompt: String) -> Result<()> {
     Ok(())
 }
 
+fn discover_markdown_files() -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(entries) = fs::read_dir(".") {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                    if ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown") {
+                        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                            out.push(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn expand_tilde(raw: &str) -> std::path::PathBuf {
+    if let Some(rest) = raw.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    std::path::PathBuf::from(raw)
+}
+
+fn read_markdown_input(target: &str) -> Result<String> {
+    if target == "-" {
+        use std::io::Read;
+        let mut buf = String::new();
+        io::stdin().read_to_string(&mut buf)?;
+        return Ok(buf);
+    }
+    let path = expand_tilde(target);
+    fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))
+}
+
+fn render_md_stdout(target: &str) -> Result<()> {
+    let content = read_markdown_input(target)?;
+    let width = crossterm::terminal::size()
+        .map(|(w, _)| w as usize)
+        .unwrap_or(100);
+    let rendered = render_markdown_ansi(&content, width);
+    print!("{rendered}");
+    Ok(())
+}
+
+fn run_md_viewer(target: &str) -> Result<()> {
+    let content = read_markdown_input(target)?;
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let _guard = TerminalGuard;
+
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+    let width = terminal.size()?.width.saturating_sub(4) as usize;
+    let lines = render_markdown_lines(&content, None, width);
+    let mut scroll: u16 = 0;
+
+    loop {
+        let max_s = (lines.len() as u16).saturating_sub(10);
+        terminal.draw(|frame| {
+            let area = frame.area();
+            let widget = Paragraph::new(lines.clone())
+                .wrap(Wrap { trim: false })
+                .scroll((scroll, 0))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(Color::LightMagenta))
+                        .title(Span::styled(
+                            format!(" {target} (Up/Down/PgUp/PgDn, q/Esc: Exit) "),
+                            Style::default()
+                                .fg(Color::LightCyan)
+                                .add_modifier(Modifier::BOLD),
+                        )),
+                );
+            frame.render_widget(widget, area);
+        })?;
+
+        if event::poll(Duration::from_millis(50))? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Press {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') => break,
+                        KeyCode::Up | KeyCode::Char('k') => scroll = scroll.saturating_sub(2),
+                        KeyCode::Down | KeyCode::Char('j') => scroll = (scroll + 2).min(max_s),
+                        KeyCode::PageUp => scroll = scroll.saturating_sub(15),
+                        KeyCode::PageDown => scroll = (scroll + 15).min(max_s),
+                        KeyCode::Home | KeyCode::Char('g') => scroll = 0,
+                        KeyCode::End | KeyCode::Char('G') => scroll = max_s,
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(first) = args.first() {
@@ -1467,17 +1623,34 @@ fn main() -> Result<()> {
                 }
                 return Ok(());
             }
+            "--render" => {
+                let target = args.get(1).context("usage: hyprpilot-tui --render <file.md | ->")?;
+                return render_md_stdout(target);
+            }
+            "--view" => {
+                let target = args.get(1).context("usage: hyprpilot-tui --view <file.md | ->")?;
+                return run_md_viewer(target);
+            }
             "--help" | "-h" => {
                 println!(
-                    "HyprPilot TUI — Persistent Background Terminal AI Assistant\n\n\
+                    "HyprPilot TUI — Persistent Background Terminal AI Assistant & Markdown Viewer\n\n\
                      USAGE:\n  \
-                       hyprpilot-tui                 Attach to persistent TUI session (auto-starts daemon)\n  \
-                       hyprpilot-tui --daemon        Run background TUI session daemon\n  \
-                       hyprpilot-tui --quit          Stop the background TUI daemon\n  \
-                       hyprpilot-tui <prompt...>     Stream a single answer to stdout\n  \
-                       hyprpilot-toggle --tui        Toggle floating TUI window on Hyprland"
+                       hyprpilot-tui                   Attach to persistent TUI session (auto-starts daemon)\n  \
+                       hyprpilot-tui --render <file>   Render a Markdown (.md) file with ANSI colors to stdout\n  \
+                       hyprpilot-tui --view <file>     Open a Markdown (.md) file in the scrollable TUI pager\n  \
+                       hyprpilot-tui <file.md>         Render existing .md file to stdout\n  \
+                       hyprpilot-tui <prompt...>       Stream a single AI answer to stdout\n  \
+                       hyprpilot-tui --daemon          Run background TUI session daemon\n  \
+                       hyprpilot-tui --quit            Stop the background TUI daemon\n  \
+                       hyprpilot-toggle --tui          Toggle floating TUI window on Hyprland"
                 );
                 return Ok(());
+            }
+            path if args.len() == 1
+                && (path.ends_with(".md") || path.ends_with(".markdown"))
+                && expand_tilde(path).is_file() =>
+            {
+                return render_md_stdout(path);
             }
             _ => return run_oneshot(args.join(" ")),
         }
@@ -1537,6 +1710,7 @@ mod tests {
             "## Find Dir\nUse `find`:\n```bash\nfind / -type d -name foo # comment\n```",
             "gemini-2.5-flash-lite",
             false,
+            90,
         );
         assert!(lines.len() >= 6);
     }

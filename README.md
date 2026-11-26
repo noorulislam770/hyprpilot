@@ -7,6 +7,7 @@ A lightweight, Windows Copilot-style AI assistant built specifically for **Arch 
 - **Dual UI Modes (GUI + TUI)**:
   - **Lightweight Native GUI (`hyprpilot`)**: `Alt + Space` (configurable) toggles a GTK4/Libadwaita window with Native Chat and persistent WebKitGTK portals.
   - **Terminal TUI (`hyprpilot-tui`)**: `Alt + Shift + Space` (configurable) pops open a floating terminal running the fast Ratatui TUI, automatically selecting your last-used provider & model and sharing SQLite history.
+  - **Terminal Markdown (`.md`) Renderer**: Render any `.md` file directly in the terminal with ANSI colors (`hyprpilot-tui README.md` / `hyprpilot-tui --render file.md`), open a scrollable viewer (`hyprpilot-tui --view file.md`), or press `Ctrl+O` inside the TUI.
 - **Instant Hyprland Toggle (`hyprpilot-toggle`)**:
   - Defaults to `Alt + Space` (GUI) and `Alt + Shift + Space` (TUI), both configurable in Settings or `~/.config/hyprpilot/config.toml`.
   - Launches centered at **50% × 50%** of your screen on first open.
@@ -112,6 +113,7 @@ HyprPilot gives you two ways to connect to AI models:
 | `Enter` / `Shift + Enter` | *(GUI)* Send prompt / Insert newline |
 | `Ctrl + P` / `Ctrl + M` / `Ctrl + R` | *(TUI)* Switch Provider / Switch Model / Fetch Models |
 | `Ctrl + G` or `F4` | *(TUI)* Browse & load SQLite chat history |
+| `Ctrl + O` | *(TUI)* Open & render a local `.md` file |
 | `Ctrl + Backspace` / `Ctrl + W` | *(TUI)* Delete previous word |
 | `Ctrl + Y` / `Ctrl + L` | *(TUI)* Copy last reply / Toggle Linux Quick mode |
 
