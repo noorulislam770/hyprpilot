@@ -1,3 +1,4 @@
+pub mod markdown_gtk;
 pub mod native_chat;
 pub mod settings;
 pub mod web_portal;

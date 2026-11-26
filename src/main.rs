@@ -10,11 +10,28 @@ use hyprpilot::hyprland::{
     toggle_or_launch,
 };
 use hyprpilot::storage::config::{AppConfig, socket_path};
-use hyprpilot::ui::{load_css, window::build_main_window};
+use hyprpilot::ui::{
+    load_css,
+    window::{build_main_window, run_gui_self_test},
+};
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(|s| s.as_str()) {
+        Some("--self-test") => {
+            let app = adw::Application::builder()
+                .application_id("dev.noor.HyprPilotSelfTest")
+                .build();
+            app.connect_startup(|_| load_css());
+            app.connect_activate(|app| run_gui_self_test(app));
+            let code = app.run_with_args::<String>(&[]);
+            if code != gtk4::glib::ExitCode::SUCCESS {
+                let exit_num: u8 = code.into();
+                anyhow::bail!("GUI self-test failed with code {exit_num}");
+            }
+            println!("GUI_SELF_TEST_OK");
+            return Ok(());
+        }
         Some("--install-hyprland") => {
             let cfg = AppConfig::load()?;
             let path = sync_hyprland_config(&cfg, true)?;

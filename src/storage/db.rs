@@ -185,6 +185,25 @@ impl HistoryDb {
             .execute("DELETE FROM conversations WHERE id = ?1", params![id])?;
         Ok(())
     }
+
+    pub fn delete_last_message_if_role(&self, conversation_id: i64, role: &str) -> Result<bool> {
+        let last: Option<(i64, String)> = self
+            .conn
+            .query_row(
+                "SELECT id, role FROM messages WHERE conversation_id = ?1 ORDER BY id DESC LIMIT 1",
+                params![conversation_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .ok();
+        if let Some((msg_id, msg_role)) = last {
+            if msg_role == role {
+                self.conn
+                    .execute("DELETE FROM messages WHERE id = ?1", params![msg_id])?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
 }
 
 fn map_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConversationSummary> {
@@ -243,6 +262,10 @@ mod tests {
         let msgs = db.get_messages(c1).unwrap();
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].role, "user");
+
+        assert!(db.delete_last_message_if_role(c1, "assistant").unwrap());
+        assert!(!db.delete_last_message_if_role(c1, "assistant").unwrap());
+        assert_eq!(db.get_messages(c1).unwrap().len(), 1);
 
         db.delete_conversation(c1).unwrap();
         assert_eq!(db.list_conversations("").unwrap().len(), 1);

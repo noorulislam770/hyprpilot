@@ -1,70 +1,329 @@
 .hyprpilot-window {
+    background-color: #262522;
+    color: #ECE9E2;
+    border-radius: 14px;
+}
+
+.claude-header {
+    background-color: #262522;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    padding: 4px 8px;
+}
+
+.claude-header-title {
+    font-weight: 600;
+    font-size: 13.5px;
+    color: #E6E2DA;
+}
+
+.claude-sidebar {
+    background-color: #1D1C1A;
+    border-right: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+.claude-brand {
+    font-size: 15px;
+    font-weight: 700;
+    color: #F4F1EA;
+}
+
+.claude-brand-spark {
+    color: #D97757;
+    font-size: 17px;
+    font-weight: 700;
+}
+
+.claude-new-chat-btn {
+    background-color: rgba(217, 119, 87, 0.16);
+    color: #F0A388;
+    border: 1px solid rgba(217, 119, 87, 0.35);
+    border-radius: 10px;
+    padding: 7px 12px;
+    font-weight: 600;
+}
+
+.claude-new-chat-btn:hover {
+    background-color: rgba(217, 119, 87, 0.26);
+}
+
+.claude-sidebar-search {
+    background-color: #262522;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 10px;
+    color: #ECE9E2;
+}
+
+.claude-section-label {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.4px;
+    color: #9A958C;
+}
+
+.claude-history-row {
+    border-radius: 9px;
+    padding: 2px 4px;
+}
+
+.claude-history-row:hover {
+    background-color: rgba(255, 255, 255, 0.06);
+}
+
+.claude-history-row-active {
+    background-color: #2E2C28;
+    border: 1px solid rgba(217, 119, 87, 0.28);
+}
+
+.claude-history-subtitle {
+    font-size: 10.5px;
+    color: #8E8980;
+}
+
+.claude-sidebar-footer {
+    border-top: 1px solid rgba(255, 255, 255, 0.07);
+    padding-top: 8px;
+}
+
+.claude-nav-pill {
+    border-radius: 9px;
+    padding: 6px 10px;
+    color: #CCC7BD;
+    font-weight: 500;
+}
+
+.claude-nav-pill:checked {
+    background-color: #2E2C28;
+    color: #F4F1EA;
+    border: 1px solid rgba(217, 119, 87, 0.45);
+}
+
+.claude-welcome-spark {
+    font-size: 32px;
+    color: #D97757;
+}
+
+.claude-welcome-title {
+    font-size: 24px;
+    font-weight: 600;
+    color: #F4F1EA;
+}
+
+.claude-welcome-sub {
+    font-size: 13.5px;
+    color: #9E998F;
+}
+
+.suggestion-chip {
+    background-color: #2F2D29;
+    border: 1px solid rgba(255, 255, 255, 0.09);
     border-radius: 12px;
+    padding: 8px 13px;
+    color: #E2DFD7;
+    font-size: 12.5px;
+}
+
+.suggestion-chip:hover {
+    background-color: #393732;
+    border-color: rgba(217, 119, 87, 0.55);
 }
 
 .chat-bubble-user {
-    background-color: alpha(@accent_bg_color, 0.22);
-    border: 1px solid alpha(@accent_bg_color, 0.45);
-    border-radius: 14px;
-    padding: 10px 14px;
+    background-color: #34322E;
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    border-radius: 16px;
+    padding: 10px 15px;
+    color: #F3F0E8;
 }
 
-.chat-bubble-assistant {
-    background-color: alpha(@card_bg_color, 0.85);
-    border: 1px solid alpha(@borders, 0.65);
-    border-radius: 14px;
-    padding: 10px 14px;
+.chat-reply-claude {
+    background-color: transparent;
+    padding: 6px 4px;
+    color: #ECE9E2;
 }
 
 .chat-bubble-error {
-    background-color: alpha(@error_bg_color, 0.25);
-    border: 1px solid alpha(@error_color, 0.6);
-    border-radius: 12px;
+    background-color: rgba(185, 74, 62, 0.18);
+    border: 1px solid rgba(214, 96, 84, 0.55);
+    border-radius: 14px;
     padding: 10px 14px;
+    color: #F6C5BE;
+}
+
+.role-label-user {
+    font-size: 11px;
+    font-weight: 700;
+    color: #A7A196;
+}
+
+.role-label-claude {
+    font-size: 12px;
+    font-weight: 700;
+    color: #E9E5DC;
+}
+
+.model-badge {
+    background-color: rgba(255, 255, 255, 0.07);
+    border-radius: 6px;
+    padding: 2px 7px;
+    font-size: 10.5px;
+    color: #B4AFA5;
+}
+
+.md-h1 {
+    font-size: 18px;
+    font-weight: 700;
+    color: #F7F4EC;
+    margin-top: 6px;
+    margin-bottom: 2px;
+}
+
+.md-h2 {
+    font-size: 15.5px;
+    font-weight: 700;
+    color: #F2EEE5;
+    margin-top: 5px;
+    margin-bottom: 2px;
+}
+
+.md-h3 {
+    font-size: 14px;
+    font-weight: 700;
+    color: #E7E2D8;
+    margin-top: 4px;
+}
+
+.md-paragraph {
+    font-size: 13.5px;
+    color: #EAE7DF;
+}
+
+.md-bullet {
+    color: #D97757;
+    font-weight: 700;
+}
+
+.md-blockquote {
+    border-left: 3px solid #D97757;
+    padding-left: 10px;
+    color: #B8B2A7;
+    font-style: italic;
 }
 
 .code-card {
-    background-color: rgba(18, 20, 26, 0.92);
-    border: 1px solid rgba(255, 255, 255, 0.12);
-    border-radius: 10px;
-    padding: 8px 10px;
+    background-color: #171614;
+    border: 1px solid rgba(255, 255, 255, 0.10);
+    border-radius: 12px;
+    margin-top: 4px;
+    margin-bottom: 4px;
+}
+
+.code-card-header {
+    background-color: #201F1C;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+    border-top-left-radius: 12px;
+    border-top-right-radius: 12px;
+    padding: 4px 10px;
 }
 
 .code-card-lang {
     font-size: 11px;
-    opacity: 0.7;
+    color: #A7A196;
     font-weight: 600;
+}
+
+.code-copy-btn {
+    font-size: 11px;
+    color: #D8D3C9;
+    padding: 2px 8px;
+    border-radius: 6px;
 }
 
 .code-card-text {
     font-family: monospace;
     font-size: 12.5px;
-    color: #e6edf3;
+    color: #ECE7DC;
+    padding: 10px 12px;
 }
 
-.composer-frame {
-    background-color: alpha(@card_bg_color, 0.9);
-    border: 1px solid alpha(@borders, 0.8);
-    border-radius: 14px;
-    padding: 6px 10px;
+.md-table-card {
+    background-color: #1D1C1A;
+    border: 1px solid rgba(255, 255, 255, 0.10);
+    border-radius: 10px;
+}
+
+.md-table-header {
+    font-weight: 700;
+    color: #F0A388;
+}
+
+.composer-card {
+    background-color: #302F2B;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 20px;
+    padding: 10px 14px 8px 14px;
+    box-shadow: 0 6px 22px rgba(0, 0, 0, 0.28);
+}
+
+.composer-card:focus-within {
+    border-color: rgba(217, 119, 87, 0.65);
 }
 
 .composer-textview {
     background: transparent;
+    color: #F4F1EA;
+    font-size: 13.5px;
+}
+
+.composer-controls {
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+    padding-top: 6px;
+}
+
+.claude-send-btn {
+    background-color: #D97757;
+    color: #FFFFFF;
+    border-radius: 999px;
+    min-width: 34px;
+    min-height: 34px;
+    padding: 0 12px;
+    font-weight: 700;
+}
+
+.claude-send-btn:hover {
+    background-color: #E38466;
+}
+
+.claude-send-btn:disabled {
+    background-color: rgba(217, 119, 87, 0.35);
+    color: rgba(255, 255, 255, 0.5);
+}
+
+.claude-stop-btn {
+    background-color: #B94A3E;
+    color: #FFFFFF;
+    border-radius: 999px;
+    min-width: 34px;
+    min-height: 34px;
+    padding: 0 12px;
+    font-weight: 700;
+}
+
+.claude-pill-toggle {
+    border-radius: 8px;
+    padding: 3px 9px;
+    font-size: 11.5px;
+    background-color: rgba(255, 255, 255, 0.05);
+    color: #CFCAC0;
+}
+
+.claude-pill-toggle:checked {
+    background-color: rgba(217, 119, 87, 0.22);
+    color: #F4B39B;
+    border: 1px solid rgba(217, 119, 87, 0.45);
 }
 
 .portal-tab-bar {
     padding: 6px 10px;
-    border-bottom: 1px solid alpha(@borders, 0.5);
-}
-
-.history-sidebar {
-    border-right: 1px solid alpha(@borders, 0.5);
-    background-color: alpha(@sidebar_bg_color, 0.6);
-}
-
-.role-label {
-    font-size: 11px;
-    font-weight: 700;
-    opacity: 0.72;
+    background-color: #1F1E1C;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.07);
 }
