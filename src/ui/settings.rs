@@ -125,7 +125,7 @@ fn build_general_page(
 
     // Hyprland Hotkey Group
     let hypr_group = adw::PreferencesGroup::new();
-    hypr_group.set_title("Hyprland Toggle & Hotkeys");
+    hypr_group.set_title("Hyprland Toggle &amp; Hotkeys");
     hypr_group.set_description(Some(
         "Pick a preset from the dropdown or click Record to press your key combo. Changes apply to Hyprland immediately.",
     ));
@@ -444,9 +444,9 @@ fn build_providers_page(config: Rc<RefCell<AppConfig>>, runtime: Rc<Runtime>) ->
     ));
 
     let group = adw::PreferencesGroup::new();
-    group.set_title("API Keys & Bearer Token Profiles");
+    group.set_title("API Keys &amp; Bearer Token Profiles");
     group.set_description(Some(
-        "Configure API keys, Ollama local endpoints, or custom Bearer tokens & headers.",
+        "Configure API keys, Ollama local endpoints, or custom Bearer tokens &amp; headers.",
     ));
 
     let provider_names: Vec<String> = config
@@ -493,7 +493,7 @@ fn build_providers_page(config: Rc<RefCell<AppConfig>>, runtime: Rc<Runtime>) ->
     save_btn.add_css_class("suggested-action");
     save_btn.set_valign(gtk4::Align::Center);
     let save_row = adw::ActionRow::new();
-    save_row.set_title("Save credentials & auto-fetch models");
+    save_row.set_title("Save credentials &amp; auto-fetch models");
     save_row.add_suffix(&save_btn);
 
     let saved_lbl = gtk4::Label::new(None);
