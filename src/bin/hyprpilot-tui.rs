@@ -1,5 +1,8 @@
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -606,8 +609,8 @@ struct TerminalGuard;
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags, LeaveAlternateScreen);
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
     }
 }
 
@@ -1209,10 +1212,10 @@ impl TuiClient {
 
         // Colorful Shortcut Footer
         let footer = Paragraph::new(Line::from(vec![
-            key_chip("Ctrl+P", "Provider"),
-            key_chip("Ctrl+M", "Model"),
+            key_chip("F2/Ctrl+P", "Provider"),
+            key_chip("F3/Ctrl+M", "Model"),
             key_chip("Ctrl+O", "Open.md"),
-            key_chip("Ctrl+G/F4", "History"),
+            key_chip("F4/Ctrl+G", "History"),
             key_chip("Ctrl+N", "New"),
             key_chip("Ctrl+Y", "Copy"),
             key_chip("Esc", "Hide"),
@@ -1661,6 +1664,10 @@ fn main() -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
+    let _ = execute!(
+        stdout,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    );
     let _guard = TerminalGuard;
 
     let backend = CrosstermBackend::new(stdout);
@@ -1673,7 +1680,7 @@ fn main() -> Result<()> {
 
         if event::poll(Duration::from_millis(45))? {
             if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
+                if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                     client.handle_key(key.code, key.modifiers);
                 }
             }

@@ -5,8 +5,11 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use hyprpilot::APP_ID;
-use hyprpilot::hyprland::{hide_window, send_ipc_command, sync_hyprland_config, toggle_or_launch};
-use hyprpilot::storage::config::AppConfig;
+use hyprpilot::hyprland::{
+    hide_window, restore_geometry_when_mapped, send_ipc_command, sync_hyprland_config,
+    toggle_or_launch,
+};
+use hyprpilot::storage::config::{AppConfig, socket_path};
 use hyprpilot::ui::{load_css, window::build_main_window};
 
 fn main() -> Result<()> {
@@ -38,6 +41,13 @@ fn main() -> Result<()> {
         }
         _ => {}
     }
+
+    // If a background instance is already alive, show & focus it immediately.
+    if send_ipc_command("SHOW") {
+        restore_geometry_when_mapped();
+        return Ok(());
+    }
+    let _ = std::fs::remove_file(socket_path());
 
     let app = adw::Application::builder().application_id(APP_ID).build();
     let hold_guard: Rc<RefCell<Option<gtk4::gio::ApplicationHoldGuard>>> =

@@ -19,6 +19,10 @@ pub struct SavedGeometry {
     pub height: i32,
     #[serde(default)]
     pub fullscreen: bool,
+    #[serde(default)]
+    pub font_size: Option<f64>,
+    #[serde(default)]
+    pub cell_height_px: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -183,6 +187,8 @@ fn snapshot_client_geometry(client: &HyprClient) -> SavedGeometry {
         width: client.size[0].max(360),
         height: client.size[1].max(300),
         fullscreen: is_fs,
+        font_size: None,
+        cell_height_px: None,
     }
 }
 
@@ -259,15 +265,117 @@ pub fn toggle_or_launch() -> Result<()> {
 
 pub fn toggle_tui_or_launch() -> Result<()> {
     if let Some(client) = find_client_by_class(TUI_APP_ID, None)? {
-        let geom = snapshot_client_geometry(&client);
+        let mut geom = snapshot_client_geometry(&client);
+        let prev = load_geometry_file("tui-window.json");
+        let prev_font = prev
+            .as_ref()
+            .and_then(|g| g.font_size)
+            .unwrap_or_else(default_kitty_font_size);
+        let prev_cell_h = prev.as_ref().and_then(|g| g.cell_height_px);
+
+        if let Some(lines) = read_kitty_lines() {
+            if lines > 0 {
+                let cur_cell_h = client.size[1] as f64 / lines as f64;
+                let font_size = match prev_cell_h {
+                    Some(pch) if pch > 1.0 => compute_zoomed_font_size(prev_font, pch, cur_cell_h),
+                    _ => prev_font,
+                };
+                geom.font_size = Some(font_size);
+                geom.cell_height_px = Some(cur_cell_h);
+            }
+        } else {
+            geom.font_size = Some(prev_font);
+            geom.cell_height_px = prev_cell_h;
+        }
+
         let _ = save_geometry_file("tui-window.json", &geom);
         dispatch_close_address(&client.address);
+        let _ = fs::remove_file(kitty_socket_path());
         return Ok(());
     }
 
     launch_tui_terminal_detached()?;
     restore_geometry_for(TUI_APP_ID, None, "tui-window.json");
+
+    // Baseline cell_height_px on first launch if not yet recorded
+    let needs_baseline = load_geometry_file("tui-window.json")
+        .is_none_or(|g| g.cell_height_px.is_none() || g.font_size.is_none());
+    if needs_baseline {
+        for _ in 0..20 {
+            thread::sleep(Duration::from_millis(40));
+            if let (Ok(Some(client)), Some(lines)) =
+                (find_client_by_class(TUI_APP_ID, None), read_kitty_lines())
+            {
+                if lines > 0 {
+                    let mut geom = load_geometry_file("tui-window.json")
+                        .unwrap_or_else(|| snapshot_client_geometry(&client));
+                    if geom.font_size.is_none() {
+                        geom.font_size = Some(default_kitty_font_size());
+                    }
+                    geom.cell_height_px = Some(client.size[1] as f64 / lines as f64);
+                    let _ = save_geometry_file("tui-window.json", &geom);
+                    break;
+                }
+            }
+        }
+    }
     Ok(())
+}
+
+fn kitty_socket_path() -> PathBuf {
+    dirs::runtime_dir()
+        .unwrap_or_else(state_dir)
+        .join("hyprpilot-kitty.sock")
+}
+
+fn read_kitty_lines() -> Option<u32> {
+    let sock = kitty_socket_path();
+    if !sock.exists() {
+        return None;
+    }
+    let out = Command::new("kitty")
+        .args(["@", "--to", &format!("unix:{}", sock.display()), "ls"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let val: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    val.as_array()?
+        .first()?
+        .get("tabs")?
+        .as_array()?
+        .first()?
+        .get("windows")?
+        .as_array()?
+        .first()?
+        .get("lines")?
+        .as_u64()
+        .map(|n| n as u32)
+}
+
+fn default_kitty_font_size() -> f64 {
+    let conf = dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("kitty/kitty.conf");
+    if let Ok(raw) = fs::read_to_string(conf) {
+        for line in raw.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("font_size") {
+                if let Ok(sz) = rest.trim().parse::<f64>() {
+                    if (6.0..=48.0).contains(&sz) {
+                        return sz;
+                    }
+                }
+            }
+        }
+    }
+    12.0
+}
+
+pub fn compute_zoomed_font_size(prev_font: f64, prev_cell_h: f64, cur_cell_h: f64) -> f64 {
+    let raw = prev_font * (cur_cell_h / prev_cell_h);
+    ((raw * 2.0).round() / 2.0).clamp(6.0, 48.0)
 }
 
 fn resolve_sibling_bin(name: &str) -> PathBuf {
@@ -303,8 +411,24 @@ fn launch_tui_terminal_detached() -> Result<()> {
     let tui_str = tui_bin.to_string_lossy().into_owned();
 
     let mut cmd = if command_exists("kitty") {
+        let sock = kitty_socket_path();
+        let _ = fs::remove_file(&sock);
+        let listen_arg = format!("unix:{}", sock.display());
         let mut c = Command::new("kitty");
-        c.args(["--class", TUI_APP_ID, "--title", "HyprPilot TUI", &tui_str]);
+        c.args([
+            "--class",
+            TUI_APP_ID,
+            "--title",
+            "HyprPilot TUI",
+            "-o",
+            "allow_remote_control=socket-only",
+            "--listen-on",
+            &listen_arg,
+        ]);
+        if let Some(sz) = load_geometry_file("tui-window.json").and_then(|g| g.font_size) {
+            c.args(["-o", &format!("font_size={sz}")]);
+        }
+        c.arg(&tui_str);
         c
     } else if command_exists("foot") {
         let mut c = Command::new("foot");
@@ -425,7 +549,45 @@ pub fn sync_hyprland_config(cfg: &AppConfig, reload_hyprland: bool) -> Result<Pa
     if reload_hyprland {
         let _ = run_hyprctl(&["reload"]);
     }
+    let _ = install_desktop_entries();
     Ok(lua_path)
+}
+
+fn install_desktop_entries() -> Result<()> {
+    let apps_dir = dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("applications");
+    fs::create_dir_all(&apps_dir)?;
+
+    let gui_bin = resolve_sibling_bin("hyprpilot");
+    let toggle_bin = resolve_sibling_bin("hyprpilot-toggle");
+
+    let gui_desktop = format!(
+        "[Desktop Entry]\n\
+         Type=Application\n\
+         Name=HyprPilot\n\
+         Comment=Lightweight Copilot-style AI Assistant for Hyprland\n\
+         Exec={}\n\
+         Icon=chat-message-new-symbolic\n\
+         Terminal=false\n\
+         Categories=Utility;Network;\n",
+        gui_bin.display()
+    );
+    fs::write(apps_dir.join("hyprpilot.desktop"), gui_desktop)?;
+
+    let tui_desktop = format!(
+        "[Desktop Entry]\n\
+         Type=Application\n\
+         Name=HyprPilot TUI\n\
+         Comment=Terminal AI Assistant & Markdown Viewer\n\
+         Exec={} --tui\n\
+         Icon=utilities-terminal\n\
+         Terminal=false\n\
+         Categories=Utility;ConsoleOnly;\n",
+        toggle_bin.display()
+    );
+    fs::write(apps_dir.join("hyprpilot-tui.desktop"), tui_desktop)?;
+    Ok(())
 }
 
 fn ensure_line_in_file(path: &Path, line: &str) -> Result<()> {
@@ -478,5 +640,16 @@ mod tests {
         }]"#;
         let clients: Vec<HyprClient> = serde_json::from_str(json).unwrap();
         assert_eq!(clients[0].workspace.name, "special:hyprpilot");
+    }
+
+    #[test]
+    fn zoom_font_size_scales_and_rounds_cleanly() {
+        // Window height 540px: 30 rows (18px/row) at 12pt -> zoomed out to 38 rows (14.21px/row)
+        let zoomed_out = compute_zoomed_font_size(12.0, 540.0 / 30.0, 540.0 / 38.0);
+        assert_eq!(zoomed_out, 9.5);
+
+        // Resized window without zooming keeps same cell height -> same font size
+        let resized_only = compute_zoomed_font_size(9.5, 14.21, 14.21);
+        assert_eq!(resized_only, 9.5);
     }
 }
