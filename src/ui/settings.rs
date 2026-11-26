@@ -156,6 +156,18 @@ fn build_providers_page(config: Rc<RefCell<AppConfig>>) -> adw::PreferencesPage 
     page.set_title("Native AI & Tokens");
     page.set_icon_name(Some("network-server-symbolic"));
 
+    let guide_group = adw::PreferencesGroup::new();
+    guide_group.set_title("Where to Get Keys vs Existing Chrome Login");
+    guide_group.set_description(Some(
+        "Your Chrome ChatGPT/Claude login uses web session cookies behind Cloudflare, not an API key. To use that account without paying for an API key, switch to the Web Portals tab (Ctrl+2) and sign in once.\n\
+         For Native Fast Chat (Ctrl+1), generate a free or paid API key from:\n\
+         • Google Gemini (Free tier): https://aistudio.google.com/apikey\n\
+         • Groq (Free tier): https://console.groq.com/keys\n\
+         • OpenRouter (Free models): https://openrouter.ai/keys\n\
+         • OpenAI: https://platform.openai.com/api-keys  |  Claude: https://console.anthropic.com\n\
+         • DeepSeek: https://platform.deepseek.com/api_keys  |  Local Ollama: no key required",
+    ));
+
     let group = adw::PreferencesGroup::new();
     group.set_title("API Keys & Bearer Token Profiles");
     group.set_description(Some(
@@ -338,6 +350,7 @@ fn build_providers_page(config: Rc<RefCell<AppConfig>>) -> adw::PreferencesPage 
     add_group.add(&custom_model);
     add_group.add(&add_row);
 
+    page.add(&guide_group);
     page.add(&group);
     page.add(&add_group);
     page

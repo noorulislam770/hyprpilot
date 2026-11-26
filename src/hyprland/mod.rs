@@ -70,11 +70,64 @@ fn run_hyprctl(args: &[&str]) -> Result<String> {
         .args(args)
         .output()
         .with_context(|| format!("failed to invoke hyprctl {:?}", args))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        anyhow::bail!("hyprctl {:?} failed: {}", args, err.trim());
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    if !out.status.success()
+        || stdout.trim_start().starts_with("error:")
+        || stdout.trim_start().starts_with("Invalid")
+    {
+        anyhow::bail!(
+            "hyprctl {:?} failed: {} {}",
+            args,
+            stdout.trim(),
+            stderr.trim()
+        );
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    Ok(stdout)
+}
+
+fn is_lua_config() -> bool {
+    hypr_config_dir().join("hyprland.lua").exists()
+}
+
+fn dispatch_move_workspace(address: &str, workspace: &str, silent: bool) -> Result<()> {
+    if is_lua_config() {
+        let silent_arg = if silent { ", silent = true" } else { "" };
+        let cmd = format!(
+            "hl.dsp.window.move({{ workspace = \"{workspace}\"{silent_arg}, window = \"address:{address}\" }})"
+        );
+        run_hyprctl(&["dispatch", &cmd])?;
+    } else {
+        let dispatcher = if silent {
+            "movetoworkspacesilent"
+        } else {
+            "movetoworkspace"
+        };
+        let arg = format!("{workspace},address:{address}");
+        run_hyprctl(&["dispatch", dispatcher, &arg])?;
+    }
+    Ok(())
+}
+
+fn dispatch_focus_address(address: &str) {
+    if is_lua_config() {
+        let cmd = format!("hl.dsp.focus({{ window = \"address:{address}\" }})");
+        let _ = run_hyprctl(&["dispatch", &cmd]);
+    } else {
+        let arg = format!("address:{address}");
+        let _ = run_hyprctl(&["dispatch", "focuswindow", &arg]);
+    }
+}
+
+fn dispatch_toggle_fullscreen() {
+    if is_lua_config() {
+        let _ = run_hyprctl(&[
+            "dispatch",
+            "hl.dsp.window.fullscreen({ mode = \"fullscreen\", action = \"toggle\" })",
+        ]);
+    } else {
+        let _ = run_hyprctl(&["dispatch", "fullscreen", "0"]);
+    }
 }
 
 fn find_hyprpilot_client() -> Result<Option<HyprClient>> {
@@ -92,10 +145,23 @@ fn active_workspace_id() -> Result<i64> {
 }
 
 fn apply_geometry_to_address(address: &str, geom: &SavedGeometry) {
-    let size_arg = format!("exact {} {},address:{}", geom.width, geom.height, address);
-    let pos_arg = format!("exact {} {},address:{}", geom.x, geom.y, address);
-    let _ = run_hyprctl(&["dispatch", "resizewindowpixel", &size_arg]);
-    let _ = run_hyprctl(&["dispatch", "movewindowpixel", &pos_arg]);
+    if is_lua_config() {
+        let resize_cmd = format!(
+            "hl.dsp.window.resize({{ x = {}, y = {}, relative = false, window = \"address:{address}\" }})",
+            geom.width, geom.height
+        );
+        let move_cmd = format!(
+            "hl.dsp.window.move({{ x = {}, y = {}, relative = false, window = \"address:{address}\" }})",
+            geom.x, geom.y
+        );
+        let _ = run_hyprctl(&["dispatch", &resize_cmd]);
+        let _ = run_hyprctl(&["dispatch", &move_cmd]);
+    } else {
+        let size_arg = format!("exact {} {},address:{}", geom.width, geom.height, address);
+        let pos_arg = format!("exact {} {},address:{}", geom.x, geom.y, address);
+        let _ = run_hyprctl(&["dispatch", "resizewindowpixel", &size_arg]);
+        let _ = run_hyprctl(&["dispatch", "movewindowpixel", &pos_arg]);
+    }
 }
 
 fn snapshot_client_geometry(client: &HyprClient) -> SavedGeometry {
@@ -127,28 +193,26 @@ pub fn hide_window() -> Result<()> {
     let _ = save_geometry(&geom);
 
     if client.fullscreen > 0 {
-        let _ = run_hyprctl(&["dispatch", "fullscreen", "0"]);
+        dispatch_focus_address(&client.address);
+        dispatch_toggle_fullscreen();
     }
-    let target = format!("{SPECIAL_WORKSPACE},address:{}", client.address);
-    run_hyprctl(&["dispatch", "movetoworkspacesilent", &target])?;
+    dispatch_move_workspace(&client.address, SPECIAL_WORKSPACE, true)?;
     Ok(())
 }
 
 fn show_window(client: &HyprClient) -> Result<()> {
-    let ws_id = active_workspace_id()?;
-    let move_arg = format!("{ws_id},address:{}", client.address);
-    run_hyprctl(&["dispatch", "movetoworkspace", &move_arg])?;
+    let ws_id = active_workspace_id()?.to_string();
+    dispatch_move_workspace(&client.address, &ws_id, false)?;
 
     let saved = load_geometry();
     if let Some(ref geom) = saved {
         apply_geometry_to_address(&client.address, geom);
     }
 
-    let focus_arg = format!("address:{}", client.address);
-    let _ = run_hyprctl(&["dispatch", "focuswindow", &focus_arg]);
+    dispatch_focus_address(&client.address);
 
     if saved.as_ref().is_some_and(|g| g.fullscreen) && client.fullscreen == 0 {
-        let _ = run_hyprctl(&["dispatch", "fullscreen", "0"]);
+        dispatch_toggle_fullscreen();
     }
     Ok(())
 }
@@ -171,10 +235,9 @@ pub fn toggle_or_launch() -> Result<()> {
             thread::sleep(Duration::from_millis(50));
             if let Ok(Some(client)) = find_hyprpilot_client() {
                 apply_geometry_to_address(&client.address, &geom);
-                let focus_arg = format!("address:{}", client.address);
-                let _ = run_hyprctl(&["dispatch", "focuswindow", &focus_arg]);
+                dispatch_focus_address(&client.address);
                 if geom.fullscreen {
-                    let _ = run_hyprctl(&["dispatch", "fullscreen", "0"]);
+                    dispatch_toggle_fullscreen();
                 }
                 break;
             }
@@ -216,7 +279,7 @@ hl.window_rule({{\n\
     match = {{ class = \"^{APP_ID}$\" }},\n\
     float = true,\n\
     center = true,\n\
-    size = \"50% 50%\",\n\
+    size = \"(monitor_w*0.5) (monitor_h*0.5)\",\n\
 }})\n\n\
 hl.bind(\"{lua_hotkey}\", hl.dsp.exec_cmd(\"{toggle_cmd}\"), {{ description = \"Toggle HyprPilot AI Assistant\" }})\n"
     )
@@ -302,7 +365,7 @@ mod tests {
     fn rendered_configs_use_custom_hotkey() {
         let lua = render_hyprland_lua("SUPER + A", "hyprpilot-toggle");
         assert!(lua.contains("hl.bind(\"SUPER + A\""));
-        assert!(lua.contains("size = \"50% 50%\""));
+        assert!(lua.contains("size = \"(monitor_w*0.5) (monitor_h*0.5)\""));
 
         let conf = render_hyprland_conf("SUPER + A", "hyprpilot-toggle");
         assert!(conf.contains("bind = SUPER, A, exec, hyprpilot-toggle"));

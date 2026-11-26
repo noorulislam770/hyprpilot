@@ -73,6 +73,27 @@ This does two things automatically:
 
 ---
 
+## Getting Tokens & Using Existing ChatGPT / Claude Logins
+
+HyprPilot gives you two ways to connect to AI models:
+
+1. **Using Your Existing ChatGPT / Claude / Copilot Account (No API Key Needed)**
+   - Your Chrome login at `chatgpt.com` or `claude.ai` uses browser web sessions protected by Cloudflare/anti-bot checks, not a developer API key.
+   - Switch to **Web Portals (`Ctrl+2`)** inside HyprPilot, select **ChatGPT** (or Claude / Copilot / Gemini / DeepSeek), and sign in **once**. Cookies stay saved in `~/.local/share/hyprpilot/webdata/` across toggles and reboots.
+
+2. **Using Native Fast Chat (`Ctrl+1`) with API Keys or Local Ollama**
+   - Open **Settings (`Ctrl+,`) → Native AI & Tokens**, choose a provider, and paste its API key:
+     - **Google Gemini (Free tier)**: `https://aistudio.google.com/apikey`
+     - **Groq (Free tier, fast Llama)**: `https://console.groq.com/keys`
+     - **OpenRouter (includes `:free` models)**: `https://openrouter.ai/keys`
+     - **OpenAI API**: `https://platform.openai.com/api-keys` *(separate from `chatgpt.com` Plus/Free web login)*
+     - **Claude (Anthropic)**: `https://console.anthropic.com/settings/keys`
+     - **DeepSeek**: `https://platform.deepseek.com/api_keys`
+     - **Ollama (Local, no key)**: Install & run `ollama serve`, then pick **Ollama (Local)**.
+     - **Custom Bearer / Token Endpoint**: For custom/self-hosted gateways accepting a Bearer token or custom headers.
+
+---
+
 ## Keyboard Shortcuts
 
 | Shortcut | Action |
