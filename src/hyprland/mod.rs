@@ -36,12 +36,14 @@ struct HyprClient {
 #[derive(Debug, Deserialize)]
 struct HyprWorkspaceRef {
     #[allow(dead_code)]
+    #[serde(default)]
     id: i64,
     name: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct HyprActiveWorkspace {
+    #[serde(default)]
     id: i64,
     #[allow(dead_code)]
     name: String,
@@ -370,5 +372,20 @@ mod tests {
         let conf = render_hyprland_conf("SUPER + A", "hyprpilot-toggle");
         assert!(conf.contains("bind = SUPER, A, exec, hyprpilot-toggle"));
         assert!(conf.contains("windowrulev2 = size 50% 50%"));
+    }
+
+    #[test]
+    fn parses_special_workspace_without_id() {
+        let json = r#"[{
+            "address": "0x123",
+            "class": "dev.noor.HyprPilot",
+            "initialClass": "dev.noor.HyprPilot",
+            "at": [100, 100],
+            "size": [900, 500],
+            "fullscreen": 0,
+            "workspace": { "address": "special", "type": "special", "name": "special:hyprpilot" }
+        }]"#;
+        let clients: Vec<HyprClient> = serde_json::from_str(json).unwrap();
+        assert_eq!(clients[0].workspace.name, "special:hyprpilot");
     }
 }
