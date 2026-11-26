@@ -1,0 +1,334 @@
+.hyprpilot-window {
+    background-color: #FAF9F5;
+    color: #1E1D1A;
+    border-radius: 14px;
+}
+
+.claude-header {
+    background-color: #FAF9F5;
+    border-bottom: 1px solid rgba(0, 0, 0, 0.08);
+    padding: 4px 8px;
+}
+
+.claude-header-title {
+    font-weight: 600;
+    font-size: 13.5px;
+    color: #24221E;
+}
+
+.claude-sidebar {
+    background-color: #F1EFE9;
+    border-right: 1px solid rgba(0, 0, 0, 0.08);
+}
+
+.claude-brand {
+    font-size: 15px;
+    font-weight: 700;
+    color: #1B1A17;
+}
+
+.claude-brand-spark {
+    color: #C96442;
+    font-size: 17px;
+    font-weight: 700;
+}
+
+.claude-new-chat-btn {
+    background-color: rgba(201, 100, 66, 0.12);
+    color: #A84A2A;
+    border: 1px solid rgba(201, 100, 66, 0.35);
+    border-radius: 10px;
+    padding: 7px 12px;
+    font-weight: 600;
+}
+
+.claude-new-chat-btn:hover {
+    background-color: rgba(201, 100, 66, 0.20);
+}
+
+.claude-sidebar-search {
+    background-color: #FFFFFF;
+    border: 1px solid rgba(0, 0, 0, 0.11);
+    border-radius: 10px;
+    color: #1E1D1A;
+}
+
+.claude-section-label {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.4px;
+    color: #706B62;
+}
+
+.claude-history-row {
+    border-radius: 9px;
+    padding: 2px 4px;
+}
+
+.claude-history-row:hover {
+    background-color: rgba(0, 0, 0, 0.05);
+}
+
+.claude-history-row-active {
+    background-color: #E7E3DA;
+    border: 1px solid rgba(201, 100, 66, 0.35);
+}
+
+.claude-history-subtitle {
+    font-size: 10.5px;
+    color: #746F66;
+}
+
+.claude-sidebar-footer {
+    border-top: 1px solid rgba(0, 0, 0, 0.08);
+    padding-top: 8px;
+}
+
+.claude-nav-pill {
+    border-radius: 9px;
+    padding: 6px 10px;
+    color: #423F38;
+    font-weight: 500;
+}
+
+.claude-nav-pill:checked {
+    background-color: #E7E3DA;
+    color: #1B1A17;
+    border: 1px solid rgba(201, 100, 66, 0.45);
+}
+
+.claude-welcome-spark {
+    font-size: 32px;
+    color: #C96442;
+}
+
+.claude-welcome-title {
+    font-size: 24px;
+    font-weight: 600;
+    color: #1B1A17;
+}
+
+.claude-welcome-sub {
+    font-size: 13.5px;
+    color: #6B665D;
+}
+
+.suggestion-chip {
+    background-color: #F0EDE5;
+    border: 1px solid rgba(0, 0, 0, 0.10);
+    border-radius: 12px;
+    padding: 8px 13px;
+    color: #2B2925;
+    font-size: 12.5px;
+}
+
+.suggestion-chip:hover {
+    background-color: #E6E2D8;
+    border-color: rgba(201, 100, 66, 0.55);
+}
+
+.chat-bubble-user {
+    background-color: #EAE6DC;
+    border: 1px solid rgba(0, 0, 0, 0.08);
+    border-radius: 16px;
+    padding: 10px 15px;
+    color: #1B1A17;
+}
+
+.chat-reply-claude {
+    background-color: transparent;
+    padding: 6px 4px;
+    color: #1E1D1A;
+}
+
+.chat-bubble-error {
+    background-color: rgba(185, 74, 62, 0.12);
+    border: 1px solid rgba(185, 74, 62, 0.45);
+    border-radius: 14px;
+    padding: 10px 14px;
+    color: #8E281E;
+}
+
+.role-label-user {
+    font-size: 11px;
+    font-weight: 700;
+    color: #6F6A61;
+}
+
+.role-label-claude {
+    font-size: 12px;
+    font-weight: 700;
+    color: #24221E;
+}
+
+.model-badge {
+    background-color: rgba(0, 0, 0, 0.06);
+    border-radius: 6px;
+    padding: 2px 7px;
+    font-size: 10.5px;
+    color: #5C574F;
+}
+
+.md-h1 {
+    font-size: 18px;
+    font-weight: 700;
+    color: #181714;
+    margin-top: 6px;
+    margin-bottom: 2px;
+}
+
+.md-h2 {
+    font-size: 15.5px;
+    font-weight: 700;
+    color: #1F1E1A;
+    margin-top: 5px;
+    margin-bottom: 2px;
+}
+
+.md-h3 {
+    font-size: 14px;
+    font-weight: 700;
+    color: #2A2823;
+    margin-top: 4px;
+}
+
+.md-paragraph {
+    font-size: 13.5px;
+    color: #23211D;
+}
+
+.md-bullet {
+    color: #C96442;
+    font-weight: 700;
+}
+
+.md-blockquote {
+    border-left: 3px solid #C96442;
+    padding-left: 10px;
+    color: #5B564E;
+    font-style: italic;
+}
+
+.code-card {
+    background-color: #F3F1EC;
+    border: 1px solid rgba(0, 0, 0, 0.11);
+    border-radius: 12px;
+    margin-top: 4px;
+    margin-bottom: 4px;
+}
+
+.code-card-header {
+    background-color: #E8E4DA;
+    border-bottom: 1px solid rgba(0, 0, 0, 0.08);
+    border-top-left-radius: 12px;
+    border-top-right-radius: 12px;
+    padding: 4px 10px;
+}
+
+.code-card-lang {
+    font-size: 11px;
+    color: #5C574F;
+    font-weight: 600;
+}
+
+.code-copy-btn {
+    font-size: 11px;
+    color: #36332D;
+    padding: 2px 8px;
+    border-radius: 6px;
+}
+
+.code-card-text {
+    font-family: monospace;
+    font-size: 12.5px;
+    color: #22201C;
+    padding: 10px 12px;
+}
+
+.md-table-card {
+    background-color: #F4F2ED;
+    border: 1px solid rgba(0, 0, 0, 0.10);
+    border-radius: 10px;
+}
+
+.md-table-header {
+    font-weight: 700;
+    color: #A84A2A;
+}
+
+.composer-card {
+    background-color: #FFFFFF;
+    border: 1px solid rgba(0, 0, 0, 0.14);
+    border-radius: 20px;
+    padding: 10px 14px 8px 14px;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.07);
+}
+
+.composer-card:focus-within {
+    border-color: rgba(201, 100, 66, 0.70);
+}
+
+.composer-textview {
+    background: transparent;
+    color: #1E1D1A;
+    font-size: 13.5px;
+}
+
+.composer-controls {
+    border-top: 1px solid rgba(0, 0, 0, 0.07);
+    padding-top: 6px;
+}
+
+.claude-send-btn {
+    background-color: #C96442;
+    color: #FFFFFF;
+    border-radius: 999px;
+    min-width: 34px;
+    min-height: 34px;
+    padding: 0 12px;
+    font-weight: 700;
+}
+
+.claude-send-btn:hover {
+    background-color: #B85534;
+}
+
+.claude-send-btn:disabled {
+    background-color: rgba(201, 100, 66, 0.35);
+    color: rgba(255, 255, 255, 0.75);
+}
+
+.claude-stop-btn {
+    background-color: #B94A3E;
+    color: #FFFFFF;
+    border-radius: 999px;
+    min-width: 34px;
+    min-height: 34px;
+    padding: 0 12px;
+    font-weight: 700;
+}
+
+.claude-pill-toggle {
+    border-radius: 8px;
+    padding: 3px 9px;
+    font-size: 11.5px;
+    background-color: rgba(0, 0, 0, 0.05);
+    color: #4A463F;
+}
+
+.claude-pill-toggle:checked {
+    background-color: rgba(201, 100, 66, 0.16);
+    color: #9F4021;
+    border: 1px solid rgba(201, 100, 66, 0.45);
+}
+
+.portal-tab-bar {
+    padding: 6px 10px;
+    background-color: #F1EFE9;
+    border-bottom: 1px solid rgba(0, 0, 0, 0.08);
+}
+
+.preview-split-panel {
+    background-color: #F6F4EE;
+    border-left: 1px solid rgba(0, 0, 0, 0.10);
+}

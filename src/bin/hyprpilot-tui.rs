@@ -592,6 +592,108 @@ fn connect_or_spawn_daemon() -> Result<(UnixStream, mpsc::UnboundedReceiver<Serv
 // Interactive Ratatui TUI Client
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
+struct CopySection {
+    label: String,
+    kind: &'static str,
+    content: String,
+}
+
+fn extract_copy_sections(markdown: &str) -> Vec<CopySection> {
+    let mut sections = Vec::new();
+    let trimmed_full = markdown.trim();
+    if trimmed_full.is_empty() {
+        return sections;
+    }
+
+    sections.push(CopySection {
+        label: "Full Reply (Clean Markdown)".to_string(),
+        kind: "ALL",
+        content: trimmed_full.to_string(),
+    });
+
+    let mut in_code = false;
+    let mut code_lang = String::new();
+    let mut code_buf = String::new();
+    let mut para_buf = String::new();
+
+    let flush_para = |buf: &mut String, out: &mut Vec<CopySection>| {
+        let p = buf.trim();
+        if !p.is_empty() {
+            let first_line = p.lines().next().unwrap_or("").trim();
+            let preview: String = first_line.chars().take(54).collect();
+            let ellipsis = if first_line.chars().count() > 54 { "…" } else { "" };
+            let kind = if first_line.starts_with('#') {
+                "HEAD"
+            } else {
+                "TEXT"
+            };
+            out.push(CopySection {
+                label: format!("{preview}{ellipsis}"),
+                kind,
+                content: p.to_string(),
+            });
+        }
+        buf.clear();
+    };
+
+    for line in trimmed_full.lines() {
+        let t = line.trim_start();
+        if t.starts_with("```") {
+            if in_code {
+                in_code = false;
+                let lang = if code_lang.is_empty() { "code" } else { &code_lang };
+                let code_trimmed = code_buf.trim_end_matches('\n').to_string();
+                if !code_trimmed.is_empty() {
+                    let first = code_trimmed
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .chars()
+                        .take(40)
+                        .collect::<String>();
+                    sections.push(CopySection {
+                        label: format!("[{lang}] {first}"),
+                        kind: "CODE",
+                        content: code_trimmed,
+                    });
+                }
+                code_buf.clear();
+                code_lang.clear();
+            } else {
+                flush_para(&mut para_buf, &mut sections);
+                in_code = true;
+                code_lang = t.trim_start_matches('`').trim().to_string();
+            }
+            continue;
+        }
+        if in_code {
+            code_buf.push_str(line);
+            code_buf.push('\n');
+        } else if line.trim().is_empty() {
+            flush_para(&mut para_buf, &mut sections);
+        } else {
+            if !para_buf.is_empty() {
+                para_buf.push('\n');
+            }
+            para_buf.push_str(line);
+        }
+    }
+    if in_code && !code_buf.trim().is_empty() {
+        let lang = if code_lang.is_empty() { "code" } else { &code_lang };
+        sections.push(CopySection {
+            label: format!("[{lang}] (unclosed)"),
+            kind: "CODE",
+            content: code_buf.trim_end_matches('\n').to_string(),
+        });
+    } else {
+        flush_para(&mut para_buf, &mut sections);
+    }
+
+    sections
+}
+
 enum Modal {
     None,
     Provider(ListState),
@@ -605,6 +707,17 @@ enum Modal {
     MarkdownViewer {
         title: String,
         lines: Vec<Line<'static>>,
+        scroll: u16,
+    },
+    CopyPicker {
+        sections: Vec<CopySection>,
+        list_state: ListState,
+        raw_reply: String,
+    },
+    CopyLines {
+        lines: Vec<String>,
+        cursor: usize,
+        anchor: Option<usize>,
         scroll: u16,
     },
 }
@@ -706,18 +819,7 @@ impl TuiClient {
         }
     }
 
-    fn copy_last_reply(&mut self) {
-        let Some(last) = self
-            .snap
-            .messages
-            .iter()
-            .rev()
-            .find(|m| m.role == "assistant")
-            .map(|m| m.content.as_str())
-        else {
-            self.local_notice = Some("No assistant reply to copy yet".into());
-            return;
-        };
+    fn copy_text_to_clipboard(&mut self, text: &str, notice: &str) {
         if let Ok(mut child) = Command::new("wl-copy")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
@@ -725,12 +827,39 @@ impl TuiClient {
             .spawn()
         {
             if let Some(mut stdin) = child.stdin.take() {
-                let _ = stdin.write_all(last.as_bytes());
+                let _ = stdin.write_all(text.as_bytes());
             }
-            self.local_notice = Some("Copied last reply to clipboard".into());
+            self.local_notice = Some(notice.to_string());
         } else {
             self.local_notice = Some("wl-copy not available".into());
         }
+    }
+
+    fn open_copy_modal(&mut self) {
+        let Some(last) = self
+            .snap
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "assistant")
+            .map(|m| m.content.clone())
+        else {
+            self.local_notice = Some("No assistant reply to copy yet".into());
+            return;
+        };
+        let sections = extract_copy_sections(&last);
+        if sections.is_empty() {
+            self.local_notice = Some("Assistant reply is empty".into());
+            return;
+        }
+        let mut st = ListState::default();
+        let default_idx = sections.iter().position(|s| s.kind == "CODE").unwrap_or(0);
+        st.select(Some(default_idx));
+        self.modal = Modal::CopyPicker {
+            sections,
+            list_state: st,
+            raw_reply: last,
+        };
     }
 
     fn handle_key(&mut self, code: KeyCode, mods: KeyModifiers) {
@@ -756,7 +885,7 @@ impl TuiClient {
                     self.scroll_offset = 0;
                     self.send_cmd(&ClientCmd::NewChat);
                 }
-                KeyCode::Char('y') => self.copy_last_reply(),
+                KeyCode::Char('y') => self.open_copy_modal(),
                 KeyCode::Char('l') => self.send_cmd(&ClientCmd::ToggleLinuxQuick),
                 _ => {}
             }
@@ -952,6 +1081,120 @@ impl TuiClient {
             }
         }
 
+        if let Modal::CopyPicker {
+            sections,
+            list_state,
+            raw_reply,
+        } = &mut self.modal
+        {
+            match code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.modal = Modal::None;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if !sections.is_empty() {
+                        let next = list_state.selected().map(|i| i.saturating_sub(1)).unwrap_or(0);
+                        list_state.select(Some(next));
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if !sections.is_empty() {
+                        let next = list_state
+                            .selected()
+                            .map(|i| (i + 1).min(sections.len() - 1))
+                            .unwrap_or(0);
+                        list_state.select(Some(next));
+                    }
+                }
+                KeyCode::Char('a') => {
+                    let text = raw_reply.trim().to_string();
+                    self.modal = Modal::None;
+                    self.copy_text_to_clipboard(&text, "Copied full reply (clean) to clipboard");
+                }
+                KeyCode::Char('v') => {
+                    let clean_lines: Vec<String> =
+                        raw_reply.lines().map(|l| l.to_string()).collect();
+                    if !clean_lines.is_empty() {
+                        self.modal = Modal::CopyLines {
+                            lines: clean_lines,
+                            cursor: 0,
+                            anchor: None,
+                            scroll: 0,
+                        };
+                    }
+                }
+                KeyCode::Char(d @ '1'..='9') => {
+                    let idx = (d as u8 - b'1') as usize;
+                    if let Some(sec) = sections.get(idx).cloned() {
+                        self.modal = Modal::None;
+                        self.copy_text_to_clipboard(
+                            &sec.content,
+                            &format!("Copied {} section to clipboard", sec.kind),
+                        );
+                    }
+                }
+                KeyCode::Enter | KeyCode::Char('y') => {
+                    if let Some(idx) = list_state.selected() {
+                        if let Some(sec) = sections.get(idx).cloned() {
+                            self.modal = Modal::None;
+                            self.copy_text_to_clipboard(
+                                &sec.content,
+                                &format!("Copied {} section to clipboard", sec.kind),
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if let Modal::CopyLines {
+            lines,
+            cursor,
+            anchor,
+            scroll,
+        } = &mut self.modal
+        {
+            let max_idx = lines.len().saturating_sub(1);
+            match code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.modal = Modal::None;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    *cursor = cursor.saturating_sub(1);
+                    if (*cursor as u16) < *scroll {
+                        *scroll = *cursor as u16;
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    *cursor = (*cursor + 1).min(max_idx);
+                    if (*cursor as u16) >= scroll.saturating_add(16) {
+                        *scroll = (*cursor as u16).saturating_sub(15);
+                    }
+                }
+                KeyCode::Char(' ') | KeyCode::Char('v') => {
+                    *anchor = if anchor.is_some() { None } else { Some(*cursor) };
+                }
+                KeyCode::Enter | KeyCode::Char('y') => {
+                    let (lo, hi) = if let Some(a) = *anchor {
+                        (a.min(*cursor), a.max(*cursor))
+                    } else {
+                        (*cursor, *cursor)
+                    };
+                    let selected = lines[lo..=hi.min(max_idx)].join("\n");
+                    let count = hi.saturating_sub(lo) + 1;
+                    self.modal = Modal::None;
+                    self.copy_text_to_clipboard(
+                        &selected,
+                        &format!("Copied {count} clean line(s) to clipboard"),
+                    );
+                }
+                _ => {}
+            }
+            return;
+        }
+
         match code {
             KeyCode::Esc => {
                 self.modal = Modal::None;
@@ -1006,27 +1249,33 @@ impl TuiClient {
                     }
                 }
             }
-            Modal::None | Modal::MarkdownPicker { .. } | Modal::MarkdownViewer { .. } => {}
+            Modal::None
+            | Modal::MarkdownPicker { .. }
+            | Modal::MarkdownViewer { .. }
+            | Modal::CopyPicker { .. }
+            | Modal::CopyLines { .. } => {}
         }
     }
 
     fn modal_len(&self) -> usize {
         match &self.modal {
-            Modal::None | Modal::MarkdownViewer { .. } => 0,
+            Modal::None | Modal::MarkdownViewer { .. } | Modal::CopyLines { .. } => 0,
             Modal::Provider(_) => self.snap.providers.len(),
             Modal::Model(_) => self.snap.models.len(),
             Modal::History(_) => self.snap.history.len(),
             Modal::MarkdownPicker { files, .. } => files.len(),
+            Modal::CopyPicker { sections, .. } => sections.len(),
         }
     }
 
     fn modal_state_mut(&mut self) -> Option<&mut ListState> {
         match &mut self.modal {
-            Modal::None | Modal::MarkdownViewer { .. } => None,
+            Modal::None | Modal::MarkdownViewer { .. } | Modal::CopyLines { .. } => None,
             Modal::Provider(s)
             | Modal::Model(s)
             | Modal::History(s)
-            | Modal::MarkdownPicker { list_state: s, .. } => Some(s),
+            | Modal::MarkdownPicker { list_state: s, .. }
+            | Modal::CopyPicker { list_state: s, .. } => Some(s),
         }
     }
 
@@ -1220,7 +1469,7 @@ impl TuiClient {
             key_chip("Ctrl+O", "Open.md"),
             key_chip("F4/Ctrl+G", "History"),
             key_chip("Ctrl+N", "New"),
-            key_chip("Ctrl+Y", "Copy"),
+            key_chip("Ctrl+Y", "Copy Section"),
             key_chip("Esc", "Hide"),
         ]));
         frame.render_widget(footer, chunks[3]);
@@ -1345,6 +1594,141 @@ impl TuiClient {
                                 title.as_str(),
                                 Style::default()
                                     .fg(Color::LightCyan)
+                                    .add_modifier(Modifier::BOLD),
+                            )),
+                    );
+                frame.render_widget(viewer, area);
+            }
+            Modal::CopyPicker {
+                sections,
+                list_state,
+                ..
+            } => {
+                let area = centered_rect(88, 80, frame.area());
+                frame.render_widget(Clear, area);
+                let parts = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
+                    .split(area);
+
+                let items: Vec<ListItem<'_>> = sections
+                    .iter()
+                    .enumerate()
+                    .map(|(i, sec)| {
+                        let badge_color = match sec.kind {
+                            "CODE" => Color::LightGreen,
+                            "HEAD" => Color::LightMagenta,
+                            "ALL" => Color::LightCyan,
+                            _ => Color::LightYellow,
+                        };
+                        let num = if i < 9 { format!("[{}] ", i + 1) } else { "    ".into() };
+                        ListItem::new(Line::from(vec![
+                            Span::styled(num, Style::default().fg(Color::DarkGray)),
+                            Span::styled(
+                                format!("[{}] ", sec.kind),
+                                Style::default().fg(badge_color).add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(sec.label.clone(), Style::default().fg(Color::White)),
+                        ]))
+                    })
+                    .collect();
+
+                let list = List::new(items)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .border_style(Style::default().fg(Color::LightCyan))
+                            .title(Span::styled(
+                                " Copy Clean Section (Enter/y: Copy | 1-9: Quick | v: Visual Lines | a: All) ",
+                                Style::default()
+                                    .fg(Color::LightCyan)
+                                    .add_modifier(Modifier::BOLD),
+                            )),
+                    )
+                    .highlight_style(
+                        Style::default()
+                            .bg(Color::Rgb(46, 76, 130))
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                    .highlight_symbol("▶ ");
+                frame.render_stateful_widget(list, parts[0], list_state);
+
+                let preview_text = list_state
+                    .selected()
+                    .and_then(|idx| sections.get(idx))
+                    .map(|s| s.content.as_str())
+                    .unwrap_or("");
+                let preview = Paragraph::new(preview_text)
+                    .wrap(Wrap { trim: false })
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .border_style(Style::default().fg(Color::Rgb(90, 120, 150)))
+                            .title(Span::styled(
+                                " Clean Clipboard Preview (Zero TUI Borders) ",
+                                Style::default().fg(Color::LightGreen),
+                            )),
+                    );
+                frame.render_widget(preview, parts[1]);
+            }
+            Modal::CopyLines {
+                lines,
+                cursor,
+                anchor,
+                scroll,
+            } => {
+                let area = centered_rect(90, 84, frame.area());
+                frame.render_widget(Clear, area);
+                let (sel_lo, sel_hi) = if let Some(a) = *anchor {
+                    (a.min(*cursor), a.max(*cursor))
+                } else {
+                    (*cursor, *cursor)
+                };
+                let rendered: Vec<Line<'static>> = lines
+                    .iter()
+                    .enumerate()
+                    .map(|(i, text)| {
+                        let in_range = i >= sel_lo && i <= sel_hi;
+                        let is_cursor = i == *cursor;
+                        let bg = if is_cursor {
+                            Color::Rgb(58, 92, 148)
+                        } else if in_range && anchor.is_some() {
+                            Color::Rgb(42, 62, 92)
+                        } else {
+                            Color::Reset
+                        };
+                        Line::from(vec![
+                            Span::styled(
+                                format!("{:>3} │ ", i + 1),
+                                Style::default().fg(Color::DarkGray).bg(bg),
+                            ),
+                            Span::styled(
+                                text.clone(),
+                                Style::default().fg(Color::White).bg(bg),
+                            ),
+                        ])
+                    })
+                    .collect();
+
+                let mode_hint = if anchor.is_some() {
+                    "VISUAL RANGE — j/k: Extend | Space/v: Clear | y/Enter: Copy Range"
+                } else {
+                    "CURSOR — j/k: Move | Space/v: Start Range | y/Enter: Copy Line"
+                };
+                let viewer = Paragraph::new(rendered)
+                    .scroll((*scroll, 0))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .border_style(Style::default().fg(Color::LightGreen))
+                            .title(Span::styled(
+                                format!(" {mode_hint} "),
+                                Style::default()
+                                    .fg(Color::LightGreen)
                                     .add_modifier(Modifier::BOLD),
                             )),
                     );
@@ -1792,5 +2176,19 @@ mod tests {
             90,
         );
         assert!(lines.len() >= 6);
+    }
+
+    #[test]
+    fn extracts_clean_copy_sections_without_tui_borders() {
+        let md = "## Overview\nRun this command:\n```bash\nls -la /tmp\n```\nDone.";
+        let secs = extract_copy_sections(md);
+        assert_eq!(secs.len(), 4);
+        assert_eq!(secs[0].kind, "ALL");
+        assert_eq!(secs[1].kind, "HEAD");
+        assert_eq!(secs[2].kind, "CODE");
+        assert_eq!(secs[2].content, "ls -la /tmp");
+        assert!(!secs[2].content.contains("│"));
+        assert_eq!(secs[3].kind, "TEXT");
+        assert_eq!(secs[3].content, "Done.");
     }
 }

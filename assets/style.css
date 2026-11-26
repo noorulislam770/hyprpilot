@@ -327,3 +327,8 @@
     background-color: #1F1E1C;
     border-bottom: 1px solid rgba(255, 255, 255, 0.07);
 }
+
+.preview-split-panel {
+    background-color: #1D1C1A;
+    border-left: 1px solid rgba(255, 255, 255, 0.08);
+}

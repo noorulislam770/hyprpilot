@@ -39,6 +39,7 @@ struct PreviewState {
     pdf_page: u32,
     pdf_total: u32,
     pdf_dpi: u32,
+    on_close: Option<Box<dyn Fn()>>,
 }
 
 impl PreviewPane {
@@ -46,23 +47,31 @@ impl PreviewPane {
         let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         root.set_vexpand(true);
         root.set_hexpand(true);
+        root.add_css_class("preview-split-panel");
 
         // Top bar
         let top_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
         top_bar.add_css_class("portal-tab-bar");
 
-        let open_btn = gtk4::Button::with_label("Open File...");
+        let open_btn = gtk4::Button::with_label("Open");
         open_btn.add_css_class("suggested-action");
+        open_btn.set_tooltip_text(Some("Open HTML, PDF, SVG, Markdown, Image, or Code file"));
 
         let path_entry = gtk4::Entry::new();
-        path_entry.set_placeholder_text(Some("Enter path to .html, .pdf, .svg, .md, image, or code..."));
+        path_entry.set_placeholder_text(Some("Path to .html, .pdf, .svg, .md, image..."));
         path_entry.set_hexpand(true);
 
-        let go_btn = gtk4::Button::with_label("Preview");
+        let go_btn = gtk4::Button::from_icon_name("go-next-symbolic");
+        go_btn.set_tooltip_text(Some("Load path"));
+
+        let close_btn = gtk4::Button::from_icon_name("window-close-symbolic");
+        close_btn.add_css_class("flat");
+        close_btn.set_tooltip_text(Some("Close Preview Panel"));
 
         top_bar.append(&open_btn);
         top_bar.append(&path_entry);
         top_bar.append(&go_btn);
+        top_bar.append(&close_btn);
 
         // PDF Controls Bar (hidden unless viewing PDF)
         let pdf_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
@@ -216,6 +225,7 @@ impl PreviewPane {
             pdf_page: 1,
             pdf_total: 1,
             pdf_dpi: 150,
+            on_close: None,
         }));
 
         let pane = Self { root, state };
@@ -224,6 +234,7 @@ impl PreviewPane {
             open_btn,
             path_entry,
             go_btn,
+            close_btn,
             pdf_prev_btn,
             pdf_next_btn,
             pdf_zoom_out,
@@ -234,6 +245,10 @@ impl PreviewPane {
         pane
     }
 
+    pub fn set_on_close(&self, cb: impl Fn() + 'static) {
+        self.state.borrow_mut().on_close = Some(Box::new(cb));
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn wire_signals(
         &self,
@@ -241,6 +256,7 @@ impl PreviewPane {
         open_btn: gtk4::Button,
         path_entry: gtk4::Entry,
         go_btn: gtk4::Button,
+        close_btn: gtk4::Button,
         pdf_prev_btn: gtk4::Button,
         pdf_next_btn: gtk4::Button,
         pdf_zoom_out: gtk4::Button,
@@ -248,6 +264,14 @@ impl PreviewPane {
         pdf_text_btn: gtk4::ToggleButton,
         copy_text_btn: gtk4::Button,
     ) {
+        {
+            let st = self.state.clone();
+            close_btn.connect_clicked(move |_| {
+                if let Some(cb) = st.borrow().on_close.as_ref() {
+                    cb();
+                }
+            });
+        }
         {
             let pane = self.clone();
             open_btn.connect_clicked(move |_| {

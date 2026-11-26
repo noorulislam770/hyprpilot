@@ -7,11 +7,29 @@ pub mod window;
 
 use gtk4::gdk;
 use gtk4::prelude::*;
+use libadwaita as adw;
 use std::process::{Command, Stdio};
+
+const DARK_CSS: &str = include_str!("../../assets/style.css");
+const LIGHT_CSS: &str = include_str!("../../assets/style_light.css");
+
+pub fn apply_theme_mode(mode: &str) {
+    let style_mgr = adw::StyleManager::default();
+    let scheme = match mode {
+        "light" => adw::ColorScheme::ForceLight,
+        "dark" => adw::ColorScheme::ForceDark,
+        _ => adw::ColorScheme::Default,
+    };
+    style_mgr.set_color_scheme(scheme);
+}
 
 pub fn load_css() {
     let provider = gtk4::CssProvider::new();
-    provider.load_from_string(include_str!("../../assets/style.css"));
+    let style_mgr = adw::StyleManager::default();
+    let apply_palette = |prov: &gtk4::CssProvider, is_dark: bool| {
+        prov.load_from_string(if is_dark { DARK_CSS } else { LIGHT_CSS });
+    };
+    apply_palette(&provider, style_mgr.is_dark());
     if let Some(display) = gdk::Display::default() {
         gtk4::style_context_add_provider_for_display(
             &display,
@@ -19,6 +37,10 @@ pub fn load_css() {
             gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
     }
+    let prov_clone = provider.clone();
+    style_mgr.connect_dark_notify(move |mgr| {
+        prov_clone.load_from_string(if mgr.is_dark() { DARK_CSS } else { LIGHT_CSS });
+    });
 }
 
 pub fn copy_to_clipboard(text: &str) {

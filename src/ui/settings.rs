@@ -416,7 +416,32 @@ fn build_general_page(
         cfg_s.borrow_mut().custom_system_prompt = r.text().to_string();
     });
 
+    let theme_row = adw::ComboRow::new();
+    theme_row.set_title("Appearance Theme");
+    theme_row.set_subtitle("Follow system dark/light preference or force a mode");
+    theme_row.set_model(Some(&gtk4::StringList::new(&[
+        "Follow System",
+        "Light",
+        "Dark",
+    ])));
+    theme_row.set_selected(match config.borrow().theme_mode.as_str() {
+        "light" => 1,
+        "dark" => 2,
+        _ => 0,
+    });
+    let cfg_t = config.clone();
+    theme_row.connect_selected_notify(move |r| {
+        let mode = match r.selected() {
+            1 => "light",
+            2 => "dark",
+            _ => "system",
+        };
+        cfg_t.borrow_mut().theme_mode = mode.to_string();
+        super::apply_theme_mode(mode);
+    });
+
     behavior_group.add(&view_row);
+    behavior_group.add(&theme_row);
     behavior_group.add(&linux_row);
     behavior_group.add(&esc_row);
     behavior_group.add(&sys_row);
