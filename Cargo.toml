@@ -17,13 +17,19 @@ path = "src/main.rs"
 name = "hyprpilot-toggle"
 path = "src/bin/hyprpilot-toggle.rs"
 
+[[bin]]
+name = "hyprpilot-tui"
+path = "src/bin/hyprpilot-tui.rs"
+
 [dependencies]
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
+crossterm = "0.29"
 dirs = "6"
 futures-util = "0.3"
 gtk4 = { version = "0.11", features = ["v4_14"] }
 libadwaita = { version = "0.9", features = ["v1_6"] }
+ratatui = { version = "0.30", features = ["crossterm_0_29"] }
 reqwest = { version = "0.13", features = ["json", "stream"] }
 rusqlite = { version = "0.38", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

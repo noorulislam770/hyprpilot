@@ -83,14 +83,18 @@ fn build_general_page(config: Rc<RefCell<AppConfig>>) -> adw::PreferencesPage {
 
     // Hyprland Hotkey Group
     let hypr_group = adw::PreferencesGroup::new();
-    hypr_group.set_title("Hyprland Toggle & Hotkey");
+    hypr_group.set_title("Hyprland Toggle & Hotkeys");
     hypr_group.set_description(Some(
-        "Default is ALT + SPACE. Changing it updates ~/.config/hypr/hyprpilot.lua & .conf.",
+        "Defaults: ALT + SPACE (GUI) and ALT + SHIFT + SPACE (TUI). Updates ~/.config/hypr/hyprpilot.lua & .conf.",
     ));
 
     let hotkey_row = adw::EntryRow::new();
-    hotkey_row.set_title("Toggle Hotkey (e.g. ALT + SPACE, SUPER + A)");
+    hotkey_row.set_title("GUI Toggle Hotkey (e.g. ALT + SPACE)");
     hotkey_row.set_text(&config.borrow().toggle_hotkey);
+
+    let tui_hotkey_row = adw::EntryRow::new();
+    tui_hotkey_row.set_title("TUI Toggle Hotkey (e.g. ALT + SHIFT + SPACE)");
+    tui_hotkey_row.set_text(&config.borrow().tui_toggle_hotkey);
 
     let status_label = gtk4::Label::new(None);
     status_label.add_css_class("dim-label");
@@ -102,20 +106,27 @@ fn build_general_page(config: Rc<RefCell<AppConfig>>) -> adw::PreferencesPage {
 
     let apply_row = adw::ActionRow::new();
     apply_row.set_title("Write Hyprland config & reload");
-    apply_row.set_subtitle("Adds 50% centered floating rule + configurable toggle bind");
+    apply_row.set_subtitle("Adds 50% centered floating rules + configurable GUI/TUI binds");
     apply_row.add_suffix(&apply_btn);
 
     let cfg_apply = config.clone();
     let hk_ref = hotkey_row.clone();
+    let tui_hk_ref = tui_hotkey_row.clone();
     let st_ref = status_label.clone();
     apply_btn.connect_clicked(move |_| {
         let new_hotkey = hk_ref.text().to_string();
+        let new_tui_hotkey = tui_hk_ref.text().to_string();
         {
             let mut cfg = cfg_apply.borrow_mut();
             cfg.toggle_hotkey = if new_hotkey.trim().is_empty() {
                 "ALT + SPACE".to_string()
             } else {
                 new_hotkey.trim().to_string()
+            };
+            cfg.tui_toggle_hotkey = if new_tui_hotkey.trim().is_empty() {
+                "ALT + SHIFT + SPACE".to_string()
+            } else {
+                new_tui_hotkey.trim().to_string()
             };
             let _ = cfg.save();
         }
@@ -127,6 +138,7 @@ fn build_general_page(config: Rc<RefCell<AppConfig>>) -> adw::PreferencesPage {
     });
 
     hypr_group.add(&hotkey_row);
+    hypr_group.add(&tui_hotkey_row);
     hypr_group.add(&apply_row);
     hypr_group.add(&status_label);
 

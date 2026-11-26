@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-use crate::{APP_ID, APP_NAME};
+use crate::{APP_ID, APP_NAME, TUI_APP_ID};
 use crate::storage::config::{AppConfig, format_hyprland_hotkey, socket_path, state_dir};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,17 +47,25 @@ struct HyprWorkspaceRef {
     name: String,
 }
 
-fn geometry_path() -> PathBuf {
-    state_dir().join("window.json")
+fn geometry_path(filename: &str) -> PathBuf {
+    state_dir().join(filename)
 }
 
 pub fn load_geometry() -> Option<SavedGeometry> {
-    let raw = fs::read_to_string(geometry_path()).ok()?;
+    load_geometry_file("window.json")
+}
+
+pub fn load_geometry_file(filename: &str) -> Option<SavedGeometry> {
+    let raw = fs::read_to_string(geometry_path(filename)).ok()?;
     serde_json::from_str(&raw).ok()
 }
 
 pub fn save_geometry(geom: &SavedGeometry) -> Result<()> {
-    let path = geometry_path();
+    save_geometry_file("window.json", geom)
+}
+
+pub fn save_geometry_file(filename: &str, geom: &SavedGeometry) -> Result<()> {
+    let path = geometry_path(filename);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -111,17 +119,33 @@ fn dispatch_toggle_fullscreen() {
     }
 }
 
-fn find_hyprpilot_client() -> Result<Option<HyprClient>> {
+fn dispatch_close_address(address: &str) {
+    if is_lua_config() {
+        let cmd = format!("hl.dsp.window.close({{ window = \"address:{address}\" }})");
+        let _ = run_hyprctl(&["dispatch", &cmd]);
+    } else {
+        let arg = format!("address:{address}");
+        let _ = run_hyprctl(&["dispatch", "closewindow", &arg]);
+    }
+}
+
+fn find_client_by_class(class_id: &str, preferred_title: Option<&str>) -> Result<Option<HyprClient>> {
     let raw = run_hyprctl(&["-j", "clients"])?;
     let clients: Vec<HyprClient> = serde_json::from_str(&raw)?;
     let matching: Vec<HyprClient> = clients
         .into_iter()
-        .filter(|c| c.class == APP_ID || c.initial_class == APP_ID)
+        .filter(|c| c.class == class_id || c.initial_class == class_id)
         .collect();
-    if let Some(pos) = matching.iter().position(|c| c.title == APP_NAME) {
-        return Ok(Some(matching.into_iter().nth(pos).unwrap()));
+    if let Some(title) = preferred_title {
+        if let Some(pos) = matching.iter().position(|c| c.title == title) {
+            return Ok(Some(matching.into_iter().nth(pos).unwrap()));
+        }
     }
     Ok(matching.into_iter().next())
+}
+
+fn find_hyprpilot_client() -> Result<Option<HyprClient>> {
+    find_client_by_class(APP_ID, Some(APP_NAME))
 }
 
 fn apply_geometry_to_address(address: &str, geom: &SavedGeometry) {
@@ -197,9 +221,13 @@ pub fn hide_window() -> Result<()> {
 }
 
 pub fn restore_geometry_when_mapped() {
-    let saved = load_geometry();
+    restore_geometry_for(APP_ID, Some(APP_NAME), "window.json");
+}
+
+fn restore_geometry_for(class_id: &str, preferred_title: Option<&str>, geom_file: &str) {
+    let saved = load_geometry_file(geom_file);
     for _ in 0..80 {
-        if let Ok(Some(client)) = find_hyprpilot_client() {
+        if let Ok(Some(client)) = find_client_by_class(class_id, preferred_title) {
             if let Some(ref geom) = saved {
                 apply_geometry_to_address(&client.address, geom);
             }
@@ -229,15 +257,29 @@ pub fn toggle_or_launch() -> Result<()> {
     Ok(())
 }
 
-fn launch_hyprpilot_detached() -> Result<()> {
-    let exe = std::env::current_exe().ok();
-    let sibling = exe
-        .as_ref()
-        .and_then(|p| p.parent())
-        .map(|dir| dir.join("hyprpilot"))
-        .filter(|p| p.exists());
+pub fn toggle_tui_or_launch() -> Result<()> {
+    if let Some(client) = find_client_by_class(TUI_APP_ID, None)? {
+        let geom = snapshot_client_geometry(&client);
+        let _ = save_geometry_file("tui-window.json", &geom);
+        dispatch_close_address(&client.address);
+        return Ok(());
+    }
 
-    let bin = sibling.unwrap_or_else(|| PathBuf::from("hyprpilot"));
+    launch_tui_terminal_detached()?;
+    restore_geometry_for(TUI_APP_ID, None, "tui-window.json");
+    Ok(())
+}
+
+fn resolve_sibling_bin(name: &str) -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|dir| dir.join(name)))
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| PathBuf::from(name))
+}
+
+fn launch_hyprpilot_detached() -> Result<()> {
+    let bin = resolve_sibling_bin("hyprpilot");
     Command::new(bin)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -247,16 +289,62 @@ fn launch_hyprpilot_detached() -> Result<()> {
     Ok(())
 }
 
+fn command_exists(bin: &str) -> bool {
+    Command::new("which")
+        .arg(bin)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+fn launch_tui_terminal_detached() -> Result<()> {
+    let tui_bin = resolve_sibling_bin("hyprpilot-tui");
+    let tui_str = tui_bin.to_string_lossy().into_owned();
+
+    let mut cmd = if command_exists("kitty") {
+        let mut c = Command::new("kitty");
+        c.args(["--class", TUI_APP_ID, "--title", "HyprPilot TUI", &tui_str]);
+        c
+    } else if command_exists("foot") {
+        let mut c = Command::new("foot");
+        c.args([
+            &format!("--app-id={TUI_APP_ID}"),
+            "--title=HyprPilot TUI",
+            &tui_str,
+        ]);
+        c
+    } else if command_exists("alacritty") {
+        let mut c = Command::new("alacritty");
+        c.args(["--class", TUI_APP_ID, "-t", "HyprPilot TUI", "-e", &tui_str]);
+        c
+    } else if command_exists("wezterm") {
+        let mut c = Command::new("wezterm");
+        c.args(["start", "--class", TUI_APP_ID, "--", &tui_str]);
+        c
+    } else {
+        anyhow::bail!("No supported terminal emulator found (tried kitty, foot, alacritty, wezterm)");
+    };
+
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to launch hyprpilot-tui in terminal")?;
+    Ok(())
+}
+
 pub fn hypr_config_dir() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("hypr")
 }
 
-pub fn render_hyprland_lua(toggle_hotkey: &str, toggle_cmd: &str) -> String {
+pub fn render_hyprland_lua(toggle_hotkey: &str, tui_hotkey: &str, toggle_cmd: &str) -> String {
     let (lua_hotkey, _) = format_hyprland_hotkey(toggle_hotkey);
+    let (lua_tui_hotkey, _) = format_hyprland_hotkey(tui_hotkey);
     format!(
-        "-- Auto-generated by HyprPilot. Edit hotkey in HyprPilot Settings or ~/.config/hyprpilot/config.toml\n\
+        "-- Auto-generated by HyprPilot. Edit hotkeys in HyprPilot Settings or ~/.config/hyprpilot/config.toml\n\
 hl.window_rule({{\n\
     name = \"hyprpilot\",\n\
     match = {{ class = \"^{APP_ID}$\" }},\n\
@@ -264,18 +352,31 @@ hl.window_rule({{\n\
     center = true,\n\
     size = \"(monitor_w*0.5) (monitor_h*0.5)\",\n\
 }})\n\n\
-hl.bind(\"{lua_hotkey}\", hl.dsp.exec_cmd(\"{toggle_cmd}\"), {{ description = \"Toggle HyprPilot AI Assistant\" }})\n"
+hl.window_rule({{\n\
+    name = \"hyprpilot-tui\",\n\
+    match = {{ class = \"^{TUI_APP_ID}$\" }},\n\
+    float = true,\n\
+    center = true,\n\
+    size = \"(monitor_w*0.5) (monitor_h*0.5)\",\n\
+}})\n\n\
+hl.bind(\"{lua_hotkey}\", hl.dsp.exec_cmd(\"{toggle_cmd}\"), {{ description = \"Toggle HyprPilot AI Assistant\" }})\n\
+hl.bind(\"{lua_tui_hotkey}\", hl.dsp.exec_cmd(\"{toggle_cmd} --tui\"), {{ description = \"Toggle HyprPilot TUI Assistant\" }})\n"
     )
 }
 
-pub fn render_hyprland_conf(toggle_hotkey: &str, toggle_cmd: &str) -> String {
+pub fn render_hyprland_conf(toggle_hotkey: &str, tui_hotkey: &str, toggle_cmd: &str) -> String {
     let (_, conf_hotkey) = format_hyprland_hotkey(toggle_hotkey);
+    let (_, conf_tui_hotkey) = format_hyprland_hotkey(tui_hotkey);
     format!(
-        "# Auto-generated by HyprPilot. Edit hotkey in HyprPilot Settings or ~/.config/hyprpilot/config.toml\n\
+        "# Auto-generated by HyprPilot. Edit hotkeys in HyprPilot Settings or ~/.config/hyprpilot/config.toml\n\
 windowrulev2 = float, class:^({APP_ID})$\n\
 windowrulev2 = size 50% 50%, class:^({APP_ID})$\n\
 windowrulev2 = center, class:^({APP_ID})$\n\n\
-bind = {conf_hotkey}, exec, {toggle_cmd}\n"
+windowrulev2 = float, class:^({TUI_APP_ID})$\n\
+windowrulev2 = size 50% 50%, class:^({TUI_APP_ID})$\n\
+windowrulev2 = center, class:^({TUI_APP_ID})$\n\n\
+bind = {conf_hotkey}, exec, {toggle_cmd}\n\
+bind = {conf_tui_hotkey}, exec, {toggle_cmd} --tui\n"
     )
 }
 
@@ -301,8 +402,14 @@ pub fn sync_hyprland_config(cfg: &AppConfig, reload_hyprland: bool) -> Result<Pa
     let lua_path = hypr_dir.join("hyprpilot.lua");
     let conf_path = hypr_dir.join("hyprpilot.conf");
 
-    fs::write(&lua_path, render_hyprland_lua(&cfg.toggle_hotkey, &toggle_cmd))?;
-    fs::write(&conf_path, render_hyprland_conf(&cfg.toggle_hotkey, &toggle_cmd))?;
+    fs::write(
+        &lua_path,
+        render_hyprland_lua(&cfg.toggle_hotkey, &cfg.tui_toggle_hotkey, &toggle_cmd),
+    )?;
+    fs::write(
+        &conf_path,
+        render_hyprland_conf(&cfg.toggle_hotkey, &cfg.tui_toggle_hotkey, &toggle_cmd),
+    )?;
 
     let hyprland_lua = hypr_dir.join("hyprland.lua");
     let custom_lua = hypr_dir.join("custom.lua");
@@ -346,12 +453,15 @@ mod tests {
 
     #[test]
     fn rendered_configs_use_custom_hotkey() {
-        let lua = render_hyprland_lua("SUPER + A", "hyprpilot-toggle");
+        let lua = render_hyprland_lua("SUPER + A", "ALT + SHIFT + SPACE", "hyprpilot-toggle");
         assert!(lua.contains("hl.bind(\"SUPER + A\""));
+        assert!(lua.contains("hl.bind(\"ALT + SHIFT + SPACE\""));
+        assert!(lua.contains("hyprpilot-toggle --tui"));
         assert!(lua.contains("size = \"(monitor_w*0.5) (monitor_h*0.5)\""));
 
-        let conf = render_hyprland_conf("SUPER + A", "hyprpilot-toggle");
+        let conf = render_hyprland_conf("SUPER + A", "ALT + SHIFT + SPACE", "hyprpilot-toggle");
         assert!(conf.contains("bind = SUPER, A, exec, hyprpilot-toggle"));
+        assert!(conf.contains("bind = ALT SHIFT, SPACE, exec, hyprpilot-toggle --tui"));
         assert!(conf.contains("windowrulev2 = size 50% 50%"));
     }
 

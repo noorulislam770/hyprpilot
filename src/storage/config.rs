@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::os::unix::fs::PermissionsExt;
 
 pub const DEFAULT_TOGGLE_HOTKEY: &str = "ALT + SPACE";
+pub const DEFAULT_TUI_TOGGLE_HOTKEY: &str = "ALT + SHIFT + SPACE";
 
 pub const LINUX_QUICK_SYSTEM_PROMPT: &str = "\
 You are HyprPilot, a concise AI assistant running on Arch Linux (Hyprland). \
@@ -58,6 +59,7 @@ pub struct PortalEntry {
 #[serde(default)]
 pub struct AppConfig {
     pub toggle_hotkey: String,
+    pub tui_toggle_hotkey: String,
     pub default_view: String,
     pub active_provider_id: String,
     pub active_portal_id: String,
@@ -72,6 +74,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             toggle_hotkey: DEFAULT_TOGGLE_HOTKEY.to_string(),
+            tui_toggle_hotkey: DEFAULT_TUI_TOGGLE_HOTKEY.to_string(),
             default_view: "native".to_string(),
             active_provider_id: "openai".to_string(),
             active_portal_id: "chatgpt".to_string(),
@@ -247,6 +250,9 @@ impl AppConfig {
         }
         if cfg.toggle_hotkey.trim().is_empty() {
             cfg.toggle_hotkey = DEFAULT_TOGGLE_HOTKEY.to_string();
+        }
+        if cfg.tui_toggle_hotkey.trim().is_empty() {
+            cfg.tui_toggle_hotkey = DEFAULT_TUI_TOGGLE_HOTKEY.to_string();
         }
         let mut migrated = false;
         for p in &mut cfg.providers {

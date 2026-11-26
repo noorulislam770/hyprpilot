@@ -4,8 +4,11 @@ A lightweight, Windows Copilot-style AI assistant built specifically for **Arch 
 
 ## Features
 
+- **Dual UI Modes (GUI + TUI)**:
+  - **Lightweight Native GUI (`hyprpilot`)**: `Alt + Space` (configurable) toggles a GTK4/Libadwaita window with Native Chat and persistent WebKitGTK portals.
+  - **Terminal TUI (`hyprpilot-tui`)**: `Alt + Shift + Space` (configurable) pops open a floating terminal running the fast Ratatui TUI, automatically selecting your last-used provider & model and sharing SQLite history.
 - **Instant Hyprland Toggle (`hyprpilot-toggle`)**:
-  - Defaults to `Alt + Space` (fully configurable in Settings or `~/.config/hyprpilot/config.toml` — never hardcoded).
+  - Defaults to `Alt + Space` (GUI) and `Alt + Shift + Space` (TUI), both configurable in Settings or `~/.config/hyprpilot/config.toml`.
   - Launches centered at **50% × 50%** of your screen on first open.
   - Remembers your **exact last floating position, size, and fullscreen state** (`~/.local/state/hyprpilot/window.json`) when toggled away and back.
   - Hides silently into `special:hyprpilot` so chats and logged-in web sessions stay warm in memory with zero reload.
@@ -37,12 +40,13 @@ sudo pacman -S --needed \
 git clone git@github.com:noorulislam770/hyprpilot.git
 cd hyprpilot
 
-# Full build (Native Chat + WebKitGTK Portals)
+# Full build (GUI + TUI + Toggle)
 cargo build --release
 
 # Install binaries into ~/.local/bin (make sure ~/.local/bin is in your PATH)
 install -Dm755 target/release/hyprpilot ~/.local/bin/hyprpilot
 install -Dm755 target/release/hyprpilot-toggle ~/.local/bin/hyprpilot-toggle
+install -Dm755 target/release/hyprpilot-tui ~/.local/bin/hyprpilot-tui
 ```
 
 ### Optional: Native-Only Build (without `webkitgtk-6.0`)
@@ -98,7 +102,8 @@ HyprPilot gives you two ways to connect to AI models:
 
 | Shortcut | Action |
 | --- | --- |
-| `Alt + Space` *(default, configurable)* | Toggle HyprPilot show/hide via Hyprland |
+| `Alt + Space` *(default, configurable)* | Toggle HyprPilot GUI show/hide via Hyprland |
+| `Alt + Shift + Space` *(default, configurable)* | Toggle HyprPilot TUI terminal (`hyprpilot-toggle --tui`) |
 | `F11` | Toggle Fullscreen |
 | `Esc` | Hide window (configurable in Settings) |
 | `Ctrl + 1` / `Ctrl + 2` | Switch between Native Chat & Web Portals |
