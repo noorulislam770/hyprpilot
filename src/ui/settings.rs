@@ -9,7 +9,28 @@ use tokio::sync::oneshot;
 
 use crate::ai::models::fetch_available_models;
 use crate::hyprland::sync_hyprland_config;
-use crate::storage::config::{AppConfig, AuthMode, PortalEntry, ProviderKind, ProviderProfile};
+use crate::storage::config::{
+    AppConfig, AuthMode, PortalEntry, ProviderKind, ProviderProfile, format_hyprland_hotkey,
+};
+
+const HOTKEY_PRESETS: &[&str] = &[
+    "ALT + SPACE",
+    "ALT + SHIFT + SPACE",
+    "SUPER + SPACE",
+    "SUPER + SHIFT + SPACE",
+    "SUPER + A",
+    "SUPER + SHIFT + A",
+    "CTRL + ALT + SPACE",
+    "ALT + Q",
+    "SUPER + GRAVE",
+];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecordTarget {
+    None,
+    Gui,
+    Tui,
+}
 
 pub fn show_settings_dialog<F>(
     parent: &adw::ApplicationWindow,
@@ -23,16 +44,18 @@ pub fn show_settings_dialog<F>(
         .title("HyprPilot Settings")
         .transient_for(parent)
         .modal(true)
-        .default_width(660)
-        .default_height(620)
+        .default_width(680)
+        .default_height(640)
         .build();
     settings_win.set_application(parent.application().as_ref());
 
-    let view_stack = adw::ViewStack::new();
-    let general_page = build_general_page(config.clone());
+    let recording = Rc::new(Cell::new(RecordTarget::None));
+    let (general_page, apply_recorded) =
+        build_general_page(config.clone(), recording.clone());
     let providers_page = build_providers_page(config.clone(), runtime);
     let portals_page = build_portals_page(config.clone());
 
+    let view_stack = adw::ViewStack::new();
     let p1 = view_stack.add_titled(&general_page, Some("general"), "General & Hyprland");
     p1.set_icon_name(Some("preferences-system-symbolic"));
     let p2 = view_stack.add_titled(&providers_page, Some("providers"), "Native AI & Tokens");
@@ -53,9 +76,23 @@ pub fn show_settings_dialog<F>(
     settings_win.set_content(Some(&toolbar));
 
     let key_ctrl = gtk4::EventControllerKey::new();
-    key_ctrl.set_propagation_phase(gtk4::PropagationPhase::Bubble);
+    key_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
     let win_esc = settings_win.clone();
-    key_ctrl.connect_key_pressed(move |_, key, _, _| {
+    let rec_ctrl = recording.clone();
+    key_ctrl.connect_key_pressed(move |_, key, _, mods| {
+        let target = rec_ctrl.get();
+        if target != RecordTarget::None {
+            if key == gtk4::gdk::Key::Escape {
+                rec_ctrl.set(RecordTarget::None);
+                apply_recorded(target, None);
+                return gtk4::glib::Propagation::Stop;
+            }
+            if let Some(combo) = gdk_event_to_hyprland_combo(key, mods) {
+                rec_ctrl.set(RecordTarget::None);
+                apply_recorded(target, Some(combo));
+            }
+            return gtk4::glib::Propagation::Stop;
+        }
         if key == gtk4::gdk::Key::Escape {
             win_esc.close();
             return gtk4::glib::Propagation::Stop;
@@ -76,7 +113,12 @@ pub fn show_settings_dialog<F>(
     settings_win.present();
 }
 
-fn build_general_page(config: Rc<RefCell<AppConfig>>) -> adw::PreferencesPage {
+type RecordedCb = Rc<dyn Fn(RecordTarget, Option<String>)>;
+
+fn build_general_page(
+    config: Rc<RefCell<AppConfig>>,
+    recording: Rc<Cell<RecordTarget>>,
+) -> (adw::PreferencesPage, RecordedCb) {
     let page = adw::PreferencesPage::new();
     page.set_title("General & Hyprland");
     page.set_icon_name(Some("preferences-system-symbolic"));
@@ -85,60 +127,244 @@ fn build_general_page(config: Rc<RefCell<AppConfig>>) -> adw::PreferencesPage {
     let hypr_group = adw::PreferencesGroup::new();
     hypr_group.set_title("Hyprland Toggle & Hotkeys");
     hypr_group.set_description(Some(
-        "Defaults: ALT + SPACE (GUI) and ALT + SHIFT + SPACE (TUI). Updates ~/.config/hypr/hyprpilot.lua & .conf.",
+        "Pick a preset from the dropdown or click Record to press your key combo. Changes apply to Hyprland immediately.",
     ));
-
-    let hotkey_row = adw::EntryRow::new();
-    hotkey_row.set_title("GUI Toggle Hotkey (e.g. ALT + SPACE)");
-    hotkey_row.set_text(&config.borrow().toggle_hotkey);
-
-    let tui_hotkey_row = adw::EntryRow::new();
-    tui_hotkey_row.set_title("TUI Toggle Hotkey (e.g. ALT + SHIFT + SPACE)");
-    tui_hotkey_row.set_text(&config.borrow().tui_toggle_hotkey);
 
     let status_label = gtk4::Label::new(None);
     status_label.add_css_class("dim-label");
     status_label.set_halign(gtk4::Align::Start);
+    status_label.set_wrap(true);
 
-    let apply_btn = gtk4::Button::with_label("Apply & Reload Hyprland");
+    let syncing = Rc::new(Cell::new(false));
+    let (gui_row, gui_dd, gui_rec_btn) =
+        build_hotkey_selector_row("GUI Toggle Hotkey", &config.borrow().toggle_hotkey);
+    let (tui_row, tui_dd, tui_rec_btn) =
+        build_hotkey_selector_row("TUI Toggle Hotkey", &config.borrow().tui_toggle_hotkey);
+
+    let sync_ui_rows = {
+        let cfg = config.clone();
+        let gui_row = gui_row.clone();
+        let gui_dd = gui_dd.clone();
+        let gui_rec_btn = gui_rec_btn.clone();
+        let tui_row = tui_row.clone();
+        let tui_dd = tui_dd.clone();
+        let tui_rec_btn = tui_rec_btn.clone();
+        let syncing = syncing.clone();
+        let rec_state = recording.clone();
+        move || {
+            syncing.set(true);
+            let (gui_hk, tui_hk) = {
+                let c = cfg.borrow();
+                (
+                    format_hyprland_hotkey(&c.toggle_hotkey).0,
+                    format_hyprland_hotkey(&c.tui_toggle_hotkey).0,
+                )
+            };
+            update_hotkey_row_widgets(&gui_row, &gui_dd, &gui_hk);
+            update_hotkey_row_widgets(&tui_row, &tui_dd, &tui_hk);
+            let cur_rec = rec_state.get();
+            gui_rec_btn.set_active(cur_rec == RecordTarget::Gui);
+            gui_rec_btn.set_label(if cur_rec == RecordTarget::Gui {
+                "Press keys..."
+            } else {
+                "Record..."
+            });
+            tui_rec_btn.set_active(cur_rec == RecordTarget::Tui);
+            tui_rec_btn.set_label(if cur_rec == RecordTarget::Tui {
+                "Press keys..."
+            } else {
+                "Record..."
+            });
+            syncing.set(false);
+        }
+    };
+
+    let commit_hotkey = {
+        let cfg = config.clone();
+        let st_ref = status_label.clone();
+        let sync_rows = sync_ui_rows.clone();
+        move |target: RecordTarget, raw_combo: &str| {
+            let (norm, _) = format_hyprland_hotkey(raw_combo);
+            let swapped = {
+                let mut c = cfg.borrow_mut();
+                let mut did_swap = false;
+                match target {
+                    RecordTarget::Gui => {
+                        let old_gui = format_hyprland_hotkey(&c.toggle_hotkey).0;
+                        let cur_tui = format_hyprland_hotkey(&c.tui_toggle_hotkey).0;
+                        if norm == cur_tui {
+                            c.tui_toggle_hotkey = old_gui;
+                            did_swap = true;
+                        }
+                        c.toggle_hotkey = norm.clone();
+                    }
+                    RecordTarget::Tui => {
+                        let old_tui = format_hyprland_hotkey(&c.tui_toggle_hotkey).0;
+                        let cur_gui = format_hyprland_hotkey(&c.toggle_hotkey).0;
+                        if norm == cur_gui {
+                            c.toggle_hotkey = old_tui;
+                            did_swap = true;
+                        }
+                        c.tui_toggle_hotkey = norm.clone();
+                    }
+                    RecordTarget::None => {}
+                }
+                let _ = c.save();
+                did_swap
+            };
+            sync_rows();
+            let snapshot = cfg.borrow().clone();
+            match sync_hyprland_config(&snapshot, true) {
+                Ok(path) => {
+                    let note = if swapped {
+                        format!(
+                            "Swapped hotkeys (GUI: {}, TUI: {}) -> {}",
+                            snapshot.toggle_hotkey,
+                            snapshot.tui_toggle_hotkey,
+                            path.display()
+                        )
+                    } else {
+                        format!(
+                            "Applied (GUI: {}, TUI: {}) -> {}",
+                            snapshot.toggle_hotkey,
+                            snapshot.tui_toggle_hotkey,
+                            path.display()
+                        )
+                    };
+                    st_ref.set_text(&note);
+                }
+                Err(e) => st_ref.set_text(&format!("Error: {e:#}")),
+            }
+        }
+    };
+
+    // Preset dropdown handlers
+    {
+        let syncing = syncing.clone();
+        let commit = commit_hotkey.clone();
+        gui_dd.connect_selected_notify(move |dd| {
+            if syncing.get() {
+                return;
+            }
+            if let Some(preset) = HOTKEY_PRESETS.get(dd.selected() as usize) {
+                commit(RecordTarget::Gui, preset);
+            }
+        });
+    }
+    {
+        let syncing = syncing.clone();
+        let commit = commit_hotkey.clone();
+        tui_dd.connect_selected_notify(move |dd| {
+            if syncing.get() {
+                return;
+            }
+            if let Some(preset) = HOTKEY_PRESETS.get(dd.selected() as usize) {
+                commit(RecordTarget::Tui, preset);
+            }
+        });
+    }
+
+    // Record button handlers
+    {
+        let syncing = syncing.clone();
+        let rec = recording.clone();
+        let sync_rows = sync_ui_rows.clone();
+        gui_rec_btn.connect_toggled(move |b| {
+            if syncing.get() {
+                return;
+            }
+            rec.set(if b.is_active() {
+                RecordTarget::Gui
+            } else {
+                RecordTarget::None
+            });
+            sync_rows();
+        });
+    }
+    {
+        let syncing = syncing.clone();
+        let rec = recording.clone();
+        let sync_rows = sync_ui_rows.clone();
+        tui_rec_btn.connect_toggled(move |b| {
+            if syncing.get() {
+                return;
+            }
+            rec.set(if b.is_active() {
+                RecordTarget::Tui
+            } else {
+                RecordTarget::None
+            });
+            sync_rows();
+        });
+    }
+
+    let swap_btn = gtk4::Button::with_label("Swap GUI ↔ TUI");
+    swap_btn.set_valign(gtk4::Align::Center);
+    let apply_btn = gtk4::Button::with_label("Reload Hyprland");
     apply_btn.add_css_class("suggested-action");
     apply_btn.set_valign(gtk4::Align::Center);
 
-    let apply_row = adw::ActionRow::new();
-    apply_row.set_title("Write Hyprland config & reload");
-    apply_row.set_subtitle("Adds 50% centered floating rules + configurable GUI/TUI binds");
-    apply_row.add_suffix(&apply_btn);
+    let actions_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    actions_box.append(&swap_btn);
+    actions_box.append(&apply_btn);
 
-    let cfg_apply = config.clone();
-    let hk_ref = hotkey_row.clone();
-    let tui_hk_ref = tui_hotkey_row.clone();
-    let st_ref = status_label.clone();
-    apply_btn.connect_clicked(move |_| {
-        let new_hotkey = hk_ref.text().to_string();
-        let new_tui_hotkey = tui_hk_ref.text().to_string();
-        {
-            let mut cfg = cfg_apply.borrow_mut();
-            cfg.toggle_hotkey = if new_hotkey.trim().is_empty() {
-                "ALT + SPACE".to_string()
-            } else {
-                new_hotkey.trim().to_string()
-            };
-            cfg.tui_toggle_hotkey = if new_tui_hotkey.trim().is_empty() {
-                "ALT + SHIFT + SPACE".to_string()
-            } else {
-                new_tui_hotkey.trim().to_string()
-            };
-            let _ = cfg.save();
-        }
-        let cfg = cfg_apply.borrow().clone();
-        match sync_hyprland_config(&cfg, true) {
-            Ok(path) => st_ref.set_text(&format!("Saved {} and reloaded Hyprland", path.display())),
-            Err(e) => st_ref.set_text(&format!("Error: {e:#}")),
+    let apply_row = adw::ActionRow::new();
+    apply_row.set_title("Quick actions");
+    apply_row.set_subtitle("Swap GUI/TUI shortcuts in one click or reload Hyprland");
+    apply_row.add_suffix(&actions_box);
+
+    {
+        let cfg_swap = config.clone();
+        let sync_rows = sync_ui_rows.clone();
+        let st_ref = status_label.clone();
+        swap_btn.connect_clicked(move |_| {
+            {
+                let mut c = cfg_swap.borrow_mut();
+                let c_ref = &mut *c;
+                std::mem::swap(&mut c_ref.toggle_hotkey, &mut c_ref.tui_toggle_hotkey);
+                let _ = c.save();
+            }
+            sync_rows();
+            let snapshot = cfg_swap.borrow().clone();
+            match sync_hyprland_config(&snapshot, true) {
+                Ok(_) => st_ref.set_text(&format!(
+                    "Swapped! GUI: {} | TUI: {}",
+                    snapshot.toggle_hotkey, snapshot.tui_toggle_hotkey
+                )),
+                Err(e) => st_ref.set_text(&format!("Error: {e:#}")),
+            }
+        });
+    }
+
+    {
+        let cfg_apply = config.clone();
+        let st_ref = status_label.clone();
+        apply_btn.connect_clicked(move |_| {
+            let snapshot = cfg_apply.borrow().clone();
+            let _ = snapshot.save();
+            match sync_hyprland_config(&snapshot, true) {
+                Ok(path) => st_ref.set_text(&format!(
+                    "Reloaded {} (GUI: {}, TUI: {})",
+                    path.display(),
+                    snapshot.toggle_hotkey,
+                    snapshot.tui_toggle_hotkey
+                )),
+                Err(e) => st_ref.set_text(&format!("Error: {e:#}")),
+            }
+        });
+    }
+
+    let recorded_cb: RecordedCb = Rc::new({
+        let sync_rows = sync_ui_rows.clone();
+        let commit = commit_hotkey;
+        move |target, maybe_combo| match maybe_combo {
+            Some(combo) => commit(target, &combo),
+            None => sync_rows(),
         }
     });
 
-    hypr_group.add(&hotkey_row);
-    hypr_group.add(&tui_hotkey_row);
+    hypr_group.add(&gui_row);
+    hypr_group.add(&tui_row);
     hypr_group.add(&apply_row);
     hypr_group.add(&status_label);
 
@@ -197,7 +423,7 @@ fn build_general_page(config: Rc<RefCell<AppConfig>>) -> adw::PreferencesPage {
 
     page.add(&hypr_group);
     page.add(&behavior_group);
-    page
+    (page, recorded_cb)
 }
 
 fn build_providers_page(config: Rc<RefCell<AppConfig>>, runtime: Rc<Runtime>) -> adw::PreferencesPage {
@@ -680,4 +906,121 @@ fn parse_headers(raw: &str) -> BTreeMap<String, String> {
         }
     }
     map
+}
+
+fn build_hotkey_selector_row(
+    title: &str,
+    initial_hotkey: &str,
+) -> (adw::ActionRow, gtk4::DropDown, gtk4::ToggleButton) {
+    let row = adw::ActionRow::new();
+    row.set_title(title);
+
+    let mut items: Vec<&str> = HOTKEY_PRESETS.to_vec();
+    items.push("Custom (use Record...)");
+    let dd = gtk4::DropDown::from_strings(&items);
+    dd.set_valign(gtk4::Align::Center);
+
+    let rec_btn = gtk4::ToggleButton::with_label("Record...");
+    rec_btn.set_valign(gtk4::Align::Center);
+
+    let suffix = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    suffix.append(&dd);
+    suffix.append(&rec_btn);
+    row.add_suffix(&suffix);
+
+    let (norm, _) = format_hyprland_hotkey(initial_hotkey);
+    update_hotkey_row_widgets(&row, &dd, &norm);
+
+    (row, dd, rec_btn)
+}
+
+fn update_hotkey_row_widgets(row: &adw::ActionRow, dd: &gtk4::DropDown, norm_hotkey: &str) {
+    row.set_subtitle(&format!("Active: {norm_hotkey}"));
+    let idx = HOTKEY_PRESETS
+        .iter()
+        .position(|&p| p == norm_hotkey)
+        .unwrap_or(HOTKEY_PRESETS.len());
+    dd.set_selected(idx as u32);
+}
+
+fn gdk_event_to_hyprland_combo(
+    key: gtk4::gdk::Key,
+    mods: gtk4::gdk::ModifierType,
+) -> Option<String> {
+    use gtk4::gdk::{Key, ModifierType};
+
+    if matches!(
+        key,
+        Key::Shift_L
+            | Key::Shift_R
+            | Key::Control_L
+            | Key::Control_R
+            | Key::Alt_L
+            | Key::Alt_R
+            | Key::Meta_L
+            | Key::Meta_R
+            | Key::Super_L
+            | Key::Super_R
+            | Key::ISO_Level3_Shift
+    ) {
+        return None;
+    }
+
+    let mut parts = Vec::new();
+    if mods.contains(ModifierType::SUPER_MASK) || mods.contains(ModifierType::META_MASK) {
+        parts.push("SUPER".to_string());
+    }
+    if mods.contains(ModifierType::ALT_MASK) {
+        parts.push("ALT".to_string());
+    }
+    if mods.contains(ModifierType::CONTROL_MASK) {
+        parts.push("CTRL".to_string());
+    }
+    if mods.contains(ModifierType::SHIFT_MASK) {
+        parts.push("SHIFT".to_string());
+    }
+
+    let key_name = match key {
+        Key::space => "SPACE".to_string(),
+        Key::Return | Key::KP_Enter => "RETURN".to_string(),
+        Key::Tab | Key::ISO_Left_Tab => "TAB".to_string(),
+        Key::grave | Key::asciitilde => "GRAVE".to_string(),
+        Key::BackSpace => "BACKSPACE".to_string(),
+        _ => {
+            let raw = key.name()?.to_string();
+            if raw.len() == 1 {
+                raw.to_uppercase()
+            } else {
+                raw.to_uppercase()
+            }
+        }
+    };
+
+    parts.push(key_name);
+    Some(parts.join(" + "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gtk4::gdk::{Key, ModifierType};
+
+    #[test]
+    fn converts_gdk_combo_to_hyprland_format() {
+        assert_eq!(
+            gdk_event_to_hyprland_combo(Key::Shift_L, ModifierType::SHIFT_MASK),
+            None
+        );
+        assert_eq!(
+            gdk_event_to_hyprland_combo(
+                Key::space,
+                ModifierType::ALT_MASK | ModifierType::SHIFT_MASK
+            ),
+            Some("ALT + SHIFT + SPACE".to_string())
+        );
+        assert_eq!(
+            gdk_event_to_hyprland_combo(Key::a, ModifierType::SUPER_MASK),
+            Some("SUPER + A".to_string())
+        );
+    }
 }
