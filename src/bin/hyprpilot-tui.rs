@@ -1715,7 +1715,29 @@ impl TuiClient {
                         self.scroll_offset = self.scroll_offset.saturating_sub(12);
                     }
                 }
-                KeyCode::Char('q') | KeyCode::Char('c') => self.should_quit = true,
+                KeyCode::Char('q') => self.should_quit = true,
+                KeyCode::Char('c') => {
+                    if let (Some(a), Some(b)) = (self.drag_anchor, self.drag_cursor) {
+                        if a != b {
+                            let text = extract_pane_selection(&self.rendered_transcript_lines, a, b);
+                            if !text.trim().is_empty() {
+                                let len = text.chars().count();
+                                self.copy_text_to_clipboard(
+                                    &text,
+                                    &format!("Copied {len} chars to clipboard"),
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    self.vim_mode = VimMode::Normal;
+                    self.pending_g = false;
+                    self.pending_w = false;
+                    self.search_query.clear();
+                    self.search_matches.clear();
+                    self.command_buf.clear();
+                    self.local_notice = Some("Normal mode (press i to type, q or Ctrl+Q to hide)".into());
+                }
                 KeyCode::Char('p') => self.open_provider_modal(),
                 KeyCode::Char('m') => self.open_model_modal(),
                 KeyCode::Char('g') => self.open_history_modal(),
@@ -1906,7 +1928,14 @@ impl TuiClient {
         self.pending_g = false;
 
         match code {
-            KeyCode::Esc | KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Esc => {
+                self.drag_anchor = None;
+                self.drag_cursor = None;
+                self.dragging = false;
+                self.local_notice = None;
+                self.focus = FocusPane::Chat;
+            }
             KeyCode::Char('i') | KeyCode::Char('a') | KeyCode::Char('o') => {
                 self.focus = FocusPane::Chat;
                 self.vim_mode = VimMode::Insert;

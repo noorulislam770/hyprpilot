@@ -113,7 +113,7 @@ impl Default for AppConfig {
             active_provider_id: "openai".to_string(),
             active_portal_id: "chatgpt".to_string(),
             linux_quick_mode: true,
-            hide_on_escape: true,
+            hide_on_escape: false,
             theme_mode: "system".to_string(),
             tui_preview_side: "right".to_string(),
             tui_pane_ratios: [20, 60, 20],
