@@ -176,15 +176,15 @@ pub fn clamp_geometry_to_monitor_bounds(
     if monitors.is_empty() {
         return geom.clone();
     }
-    let cx = geom.x + geom.width / 2;
-    let cy = geom.y + geom.height / 2;
+    // Always target the currently focused monitor so the popup appears where the user is looking.
     let target = monitors
         .iter()
-        .find(|&&(mx, my, mw, mh, _)| cx >= mx && cx < mx + mw && cy >= my && cy < my + mh)
-        .or_else(|| monitors.iter().find(|&&(_, _, _, _, f)| f))
+        .find(|&&(_, _, _, _, f)| f)
         .unwrap_or(&monitors[0]);
 
     let (mx, my, mw, mh, _) = *target;
+    let cx = geom.x + geom.width / 2;
+    let cy = geom.y + geom.height / 2;
     let w = geom.width.min((mw - 24).max(360)).max(360);
     let h = geom.height.min((mh - 24).max(300)).max(300);
     let on_target = cx >= mx && cx < mx + mw && cy >= my && cy < my + mh;
@@ -312,7 +312,7 @@ fn dispatch_move_to_workspace(address: &str, ws_id: i64) {
 fn restore_geometry_for(class_id: &str, preferred_title: Option<&str>, geom_file: &str) {
     let saved = load_geometry_file(geom_file);
     let active_ws = fetch_active_workspace_id();
-    for _ in 0..80 {
+    for _ in 0..150 {
         if let Ok(Some(client)) = find_client_by_class(class_id, preferred_title) {
             if let Some(ws_id) = active_ws {
                 if client.workspace.id != ws_id {
@@ -484,11 +484,16 @@ fn resolve_sibling_bin(name: &str) -> PathBuf {
 
 fn launch_hyprpilot_detached() -> Result<()> {
     let bin = resolve_sibling_bin("hyprpilot");
-    Command::new(bin)
-        .stdin(Stdio::null())
+    let mut cmd = Command::new(bin);
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    cmd.spawn()
         .context("failed to launch hyprpilot binary")?;
     Ok(())
 }

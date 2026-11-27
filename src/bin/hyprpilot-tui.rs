@@ -1061,6 +1061,9 @@ enum Modal {
         lines: Vec<Line<'static>>,
         scroll: u16,
     },
+    ModelSpecs {
+        scroll: u16,
+    },
     CopyPicker {
         sections: Vec<CopySection>,
         list_state: ListState,
@@ -1650,7 +1653,7 @@ impl TuiClient {
                 if let Some(sr) = self.last_specs_rect {
                     if in_rect(sr) {
                         self.preview_open = false;
-                        self.open_provider_modal();
+                        self.modal = Modal::ModelSpecs { scroll: 0 };
                     }
                 }
             }
@@ -2306,6 +2309,7 @@ impl TuiClient {
             KeyCode::Char('m') => self.open_model_modal(),
             KeyCode::Char('z') => self.chat_zoomed = !self.chat_zoomed,
             KeyCode::Char('Z') => self.send_cmd(&ClientCmd::ToggleZenMode),
+            KeyCode::Char('I') => self.modal = Modal::ModelSpecs { scroll: 0 },
             KeyCode::Char('r') => self.send_cmd(&ClientCmd::FetchModels),
             KeyCode::F(2) => self.open_provider_modal(),
             KeyCode::F(3) => self.open_model_modal(),
@@ -2468,6 +2472,9 @@ impl TuiClient {
             "zen" => {
                 self.send_cmd(&ClientCmd::ToggleZenMode);
             }
+            "specs" | "info" => {
+                self.modal = Modal::ModelSpecs { scroll: 0 };
+            }
             "m" | "model" => self.open_model_modal(),
             "prov" | "provider" => self.open_provider_modal(),
             "hist" | "history" => self.open_history_modal(),
@@ -2585,6 +2592,25 @@ impl TuiClient {
     }
 
     fn handle_modal_key(&mut self, code: KeyCode) {
+        if let Modal::ModelSpecs { scroll } = &mut self.modal {
+            match code {
+                KeyCode::Esc | KeyCode::Char('q') => self.modal = Modal::None,
+                KeyCode::Char('m') => {
+                    self.modal = Modal::None;
+                    self.open_model_modal();
+                }
+                KeyCode::Char('p') => {
+                    self.modal = Modal::None;
+                    self.open_provider_modal();
+                }
+                KeyCode::Char('r') => self.send_cmd(&ClientCmd::FetchModels),
+                KeyCode::Up | KeyCode::Char('k') => *scroll = scroll.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => *scroll = (*scroll + 1).min(20),
+                _ => {}
+            }
+            return;
+        }
+
         if let Modal::PreviewFull {
             content,
             lines,
@@ -2980,6 +3006,7 @@ impl TuiClient {
             | Modal::MarkdownPicker { .. }
             | Modal::MarkdownViewer { .. }
             | Modal::PreviewFull { .. }
+            | Modal::ModelSpecs { .. }
             | Modal::CopyPicker { .. }
             | Modal::CopyLines { .. } => {}
         }
@@ -2991,6 +3018,7 @@ impl TuiClient {
             | Modal::Help { .. }
             | Modal::MarkdownViewer { .. }
             | Modal::PreviewFull { .. }
+            | Modal::ModelSpecs { .. }
             | Modal::CopyLines { .. } => 0,
             Modal::Provider(_) => self.snap.providers.len(),
             Modal::Model(_) => self.snap.models.len(),
@@ -3006,6 +3034,7 @@ impl TuiClient {
             | Modal::Help { .. }
             | Modal::MarkdownViewer { .. }
             | Modal::PreviewFull { .. }
+            | Modal::ModelSpecs { .. }
             | Modal::CopyLines { .. } => None,
             Modal::Provider(s)
             | Modal::Model(s)
@@ -4216,6 +4245,95 @@ impl TuiClient {
                     )
                     .highlight_symbol("▶ ");
                 frame.render_stateful_widget(list, parts[1], list_state);
+            }
+            Modal::ModelSpecs { scroll } => {
+                let area = centered_rect(76, 76, frame.area());
+                self.last_modal_rect = Some(area);
+                frame.render_widget(Clear, area);
+                let parts = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(10), Constraint::Length(1)])
+                    .split(area);
+
+                let (ctx_win, tier, api_proto) =
+                    infer_model_specs(&self.snap.model, &self.snap.provider_kind);
+                let mut total_in = 0u64;
+                let mut total_out = 0u64;
+                let mut total_tok = 0u64;
+                let mut total_ms = 0u64;
+                let mut stat_count = 0u64;
+                for m in &self.snap.messages {
+                    if let Some(ref st) = m.stats {
+                        total_in += st.input_tokens.unwrap_or(0);
+                        total_out += st.output_tokens.unwrap_or(0);
+                        total_tok += st.total_tokens.unwrap_or(
+                            st.input_tokens.unwrap_or(0) + st.output_tokens.unwrap_or(0),
+                        );
+                        total_ms += st.duration_ms;
+                        stat_count += 1;
+                    }
+                }
+                let avg_s = if stat_count > 0 {
+                    format!("{:.2}s", (total_ms as f64 / stat_count as f64) / 1000.0)
+                } else {
+                    "—".into()
+                };
+
+                let kv = |k: &'static str, v: String, c: Color| {
+                    Line::from(vec![
+                        Span::styled(format!("  {k:<18} "), Style::default().fg(Color::DarkGray)),
+                        Span::styled(v, Style::default().fg(c).add_modifier(Modifier::BOLD)),
+                    ])
+                };
+                let spec_lines = vec![
+                    Line::from(Span::styled(
+                        "  Active Model & Provider",
+                        Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(""),
+                    kv("Provider", self.snap.provider_name.clone(), Color::LightCyan),
+                    kv("Model ID", self.snap.model.clone(), Color::LightYellow),
+                    kv("Context Window", ctx_win.to_string(), Color::LightGreen),
+                    kv("Speed / Cost Tier", tier.to_string(), Color::LightMagenta),
+                    kv("API Protocol", api_proto.to_string(), Color::White),
+                    kv("Auth Mode", self.snap.provider_auth.clone(), Color::Gray),
+                    kv("Endpoint URL", self.snap.provider_base_url.clone(), Color::Gray),
+                    kv("Cached Models", format!("{} available", self.snap.models.len()), Color::LightYellow),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "  Current Session Telemetry",
+                        Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(""),
+                    kv("Messages", format!("{}", self.snap.messages.len()), Color::White),
+                    kv("Input Tokens", format!("{total_in}"), Color::LightCyan),
+                    kv("Output Tokens", format!("{total_out}"), Color::LightGreen),
+                    kv("Total Tokens", format!("{total_tok}"), Color::LightYellow),
+                    kv("Avg Latency", avg_s, Color::LightMagenta),
+                    kv("Linux Quick Mode", if self.snap.linux_quick_mode { "ON".into() } else { "OFF".into() }, Color::LightGreen),
+                ];
+
+                let p = Paragraph::new(spec_lines)
+                    .wrap(Wrap { trim: false })
+                    .scroll((*scroll, 0))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .border_style(Style::default().fg(Color::LightYellow))
+                            .title(Span::styled(
+                                " Model & Session Specifications (Click outside or Esc to close) ",
+                                Style::default().fg(Color::LightYellow).add_modifier(Modifier::BOLD),
+                            )),
+                    );
+                frame.render_widget(p, parts[0]);
+                let foot = Paragraph::new(Line::from(vec![
+                    key_chip("m", "Switch Model"),
+                    key_chip("p", "Switch Provider"),
+                    key_chip("r", "Refresh Models"),
+                    key_chip("Esc/q", "Close"),
+                ]));
+                frame.render_widget(foot, parts[1]);
             }
             Modal::PreviewFull {
                 title,
