@@ -3468,12 +3468,39 @@ impl TuiClient {
             }
         }
 
+        // Pre-wrap prompt input so the input box grows vertically instead of overflowing to the right
+        let input_inner_w = center_area.width.saturating_sub(2).max(20) as usize;
+        let cursor_span = if self.vim_mode == VimMode::Insert {
+            Span::styled("█", Style::default().fg(Color::LightCyan))
+        } else {
+            Span::styled(" ", Style::default())
+        };
+        let raw_input_line = Line::from(vec![
+            Span::styled(
+                " ❯ ",
+                Style::default()
+                    .fg(Color::LightMagenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(self.input.clone(), Style::default().fg(Color::White)),
+            cursor_span,
+        ]);
+        let mut wrapped_input = wrap_styled_line_preserving_prefix(raw_input_line, 1, input_inner_w);
+        for line in wrapped_input.iter_mut().skip(1) {
+            if let Some(first) = line.spans.first_mut() {
+                first.content = "   ".into();
+            }
+        }
+        let max_input_h = (center_area.height / 3).clamp(4, 12);
+        let input_height = ((wrapped_input.len() as u16) + 2).clamp(3, max_input_h);
+        let input_scroll = (wrapped_input.len() as u16).saturating_sub(input_height.saturating_sub(2));
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(3),
                 Constraint::Min(6),
-                Constraint::Length(3),
+                Constraint::Length(input_height),
                 Constraint::Length(1),
             ])
             .split(center_area);
@@ -3779,29 +3806,16 @@ impl TuiClient {
             );
         frame.render_widget(transcript, chunks[1]);
 
-        // Input Box
-        let cursor_span = if self.vim_mode == VimMode::Insert {
-            Span::styled("█", Style::default().fg(Color::LightCyan))
-        } else {
-            Span::styled(" ", Style::default())
-        };
+        // Input Box (vertically expanding, wrapped)
         let input_title = match self.vim_mode {
             VimMode::Insert => " Ask (Enter: Send | Esc: Normal Mode | Ctrl+Bksp: Del Word) ",
             VimMode::Normal => " Normal Mode (i: Insert | j/k: Scroll | /: Search | :: Cmd | ?: Help) ",
             VimMode::Search => " Search Mode (Enter: Jump | Esc: Cancel) ",
             VimMode::Command => " Command Mode (Enter: Run | Esc: Cancel) ",
         };
-        let input_box = Paragraph::new(Line::from(vec![
-            Span::styled(
-                " ❯ ",
-                Style::default()
-                    .fg(Color::LightMagenta)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(self.input.clone(), Style::default().fg(Color::White)),
-            cursor_span,
-        ]))
-        .block(
+        let input_box = Paragraph::new(wrapped_input)
+            .scroll((input_scroll, 0))
+            .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
@@ -5194,5 +5208,22 @@ mod tests {
         assert_eq!(selected, "Hello world\nSecond line here");
         assert!(!selected.contains("│"));
         assert!(!selected.contains("╭"));
+    }
+
+    #[test]
+    fn long_prompt_wraps_vertically_without_overflowing() {
+        let raw = Line::from(vec![
+            Span::styled(" ❯ ", Style::default().fg(Color::LightMagenta)),
+            Span::styled(
+                "Explain how Linux namespaces and cgroups isolate containers in detail please",
+                Style::default().fg(Color::White),
+            ),
+            Span::styled("█", Style::default().fg(Color::LightCyan)),
+        ]);
+        let wrapped = wrap_styled_line_preserving_prefix(raw, 1, 32);
+        assert!(wrapped.len() >= 3);
+        for l in &wrapped {
+            assert!(l.width() <= 32);
+        }
     }
 }
