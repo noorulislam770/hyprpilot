@@ -28,7 +28,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
 use hyprpilot::ai::models::fetch_available_models;
-use hyprpilot::ai::{AiMessage, StreamEvent, stream_chat};
+use hyprpilot::ai::{AiMessage, ResponseStats, StreamEvent, stream_chat};
 use hyprpilot::markdown::{render_markdown_ansi, render_markdown_lines};
 use hyprpilot::preview::{
     PreviewKind, detect_preview_kind, expand_user_path, extract_pdf_text,
@@ -47,6 +47,8 @@ use hyprpilot::storage::db::{ConversationSummary, HistoryDb, derive_title_from_p
 struct WireMessage {
     role: String,
     content: String,
+    #[serde(default)]
+    stats: Option<ResponseStats>,
 }
 
 fn default_pane_ratios() -> [u16; 3] {
@@ -140,6 +142,7 @@ struct DaemonState {
     db: Option<HistoryDb>,
     active_conversation_id: Option<i64>,
     messages: Vec<AiMessage>,
+    message_stats: Vec<Option<ResponseStats>>,
     streaming: bool,
     streaming_reply: String,
     status: String,
@@ -217,9 +220,11 @@ impl DaemonState {
             messages: self
                 .messages
                 .iter()
-                .map(|m| WireMessage {
+                .enumerate()
+                .map(|(i, m)| WireMessage {
                     role: m.role.clone(),
                     content: m.content.clone(),
+                    stats: self.message_stats.get(i).cloned().flatten(),
                 })
                 .collect(),
             streaming: self.streaming,
@@ -272,6 +277,7 @@ fn run_daemon() -> Result<()> {
         db,
         active_conversation_id: None,
         messages: Vec::new(),
+        message_stats: Vec::new(),
         streaming: false,
         streaming_reply: String::new(),
         status: "Ready — ask anything or press Ctrl+P / Ctrl+M".to_string(),
@@ -421,6 +427,7 @@ fn handle_daemon_cmd(
             }
             guard.active_conversation_id = None;
             guard.messages.clear();
+            guard.message_stats.clear();
             guard.streaming_reply.clear();
             guard.status = "Started new chat".to_string();
             guard.broadcast_snapshot();
@@ -580,6 +587,7 @@ fn handle_daemon_cmd(
             if let Some(db) = &guard.db {
                 let msgs = db.get_messages(id).unwrap_or_default();
                 guard.active_conversation_id = Some(id);
+                guard.message_stats = vec![None; msgs.len()];
                 guard.messages = msgs
                     .into_iter()
                     .map(|m| AiMessage {
@@ -636,6 +644,7 @@ fn handle_daemon_cmd(
                     role: "user".into(),
                     content: prompt,
                 });
+                guard.message_stats.push(None);
                 guard.streaming = true;
                 guard.streaming_reply.clear();
                 guard.status = format!("Streaming from {} ({})...", provider.name, provider.model);
@@ -655,12 +664,16 @@ fn handle_daemon_cmd(
             let st = Arc::clone(state);
             runtime.spawn(async move {
                 let mut err_msg: Option<String> = None;
+                let mut last_stats: Option<ResponseStats> = None;
                 while let Some(ev) = rx.recv().await {
                     match ev {
                         StreamEvent::Delta(chunk) => {
                             let mut guard = st.lock().unwrap();
                             guard.streaming_reply.push_str(&chunk);
                             guard.broadcast(ServerEvent::Delta { text: chunk });
+                        }
+                        StreamEvent::Stats(s) => {
+                            last_stats = Some(s);
                         }
                         StreamEvent::Done => break,
                         StreamEvent::Error(e) => {
@@ -679,7 +692,16 @@ fn handle_daemon_cmd(
                         format!("{}\n\n[Error: {err}]", guard.streaming_reply)
                     }
                 } else {
-                    guard.status = "Done (Ctrl+Y to copy last reply)".to_string();
+                    if let Some(ref s) = last_stats {
+                        let summary = s.format_compact();
+                        if !summary.is_empty() {
+                            guard.status = format!("Done • {summary}");
+                        } else {
+                            guard.status = "Done (Ctrl+Y to copy)".to_string();
+                        }
+                    } else {
+                        guard.status = "Done (Ctrl+Y to copy)".to_string();
+                    }
                     std::mem::take(&mut guard.streaming_reply)
                 };
                 guard.streaming_reply.clear();
@@ -690,6 +712,7 @@ fn handle_daemon_cmd(
                     role: "assistant".into(),
                     content: final_text,
                 });
+                guard.message_stats.push(last_stats);
                 guard.broadcast_snapshot();
             });
         }
@@ -1032,6 +1055,12 @@ enum Modal {
         lines: Vec<Line<'static>>,
         scroll: u16,
     },
+    PreviewFull {
+        title: String,
+        content: String,
+        lines: Vec<Line<'static>>,
+        scroll: u16,
+    },
     CopyPicker {
         sections: Vec<CopySection>,
         list_state: ListState,
@@ -1092,6 +1121,9 @@ struct TuiClient {
     last_right_rect: Option<Rect>,
     rendered_transcript_lines: Vec<String>,
     transcript_row_artifacts: Vec<Option<TuiArtifact>>,
+    copy_button_hitboxes: Vec<(usize, u16, u16, String)>,
+    last_preview_bar_rect: Option<Rect>,
+    preview_copy_x_range: Option<(u16, u16)>,
     drag_anchor: Option<(usize, usize)>,
     drag_cursor: Option<(usize, usize)>,
     dragging: bool,
@@ -1171,6 +1203,9 @@ impl TuiClient {
             last_right_rect: None,
             rendered_transcript_lines: Vec::new(),
             transcript_row_artifacts: Vec::new(),
+            copy_button_hitboxes: Vec::new(),
+            last_preview_bar_rect: None,
+            preview_copy_x_range: None,
             drag_anchor: None,
             drag_cursor: None,
             dragging: false,
@@ -1235,6 +1270,7 @@ impl TuiClient {
                         self.preview_idx = 0;
                     }
                     if finished_stream
+                        && !self.snap.zen_mode
                         && self.snap.auto_preview_md
                         && has_rich_md_artifact(&self.snap.messages)
                     {
@@ -1492,18 +1528,46 @@ impl TuiClient {
                     }
                 }
 
-                // 0b. Clicking top border of Preview pane toggles back to Model View
+                // 0b. Clicking Preview bar: [Copy (y)] copies active preview; rest of bar opens Full Modal!
                 if self.preview_open {
+                    if let Some(pbar) = self.last_preview_bar_rect {
+                        if in_rect(pbar) {
+                            if let Some((cx0, cx1)) = self.preview_copy_x_range {
+                                if me.column >= cx0 && me.column < cx1 {
+                                    if let Some(art) =
+                                        self.preview_artifacts.get(self.preview_idx).cloned()
+                                    {
+                                        self.copy_text_to_clipboard(
+                                            &art.content,
+                                            &format!("Copied {} to clipboard", art.title),
+                                        );
+                                    }
+                                    return;
+                                }
+                            }
+                            self.open_preview_full_modal();
+                            return;
+                        }
+                    }
                     if let Some(rr) = self.last_right_rect {
-                        if me.row == rr.y && me.column >= rr.x && me.column < rr.x + rr.width {
-                            self.preview_open = false;
+                        if in_rect(rr) {
+                            self.focus = FocusPane::Inspector;
                             return;
                         }
                     }
                 }
 
-                // 1. Center Transcript: start pane-clamped drag selection
+                // 1. Center Transcript: check [Copy] button hitboxes first, then start pane-clamped drag
                 if in_rect(tr) {
+                    let row_idx = (me.row.saturating_sub(tr.y + 1)) as usize
+                        + self.scroll_offset as usize;
+                    let col_idx = me.column.saturating_sub(tr.x + 1);
+                    for &(r_idx, x0, x1, ref txt) in &self.copy_button_hitboxes.clone() {
+                        if r_idx == row_idx && col_idx >= x0 && col_idx < x1 {
+                            self.copy_text_to_clipboard(txt, "Copied response/artifact to clipboard");
+                            return;
+                        }
+                    }
                     let pos = clamp_to_transcript(me.column, me.row);
                     self.drag_anchor = Some(pos);
                     self.drag_cursor = Some(pos);
@@ -1523,8 +1587,9 @@ impl TuiClient {
                     return;
                 }
 
-                // 3. Input Box: focus & enter Insert mode
+                // 3. Input Box: clicking away from preview dismisses preview & enters Insert mode
                 if in_rect(self.last_input_rect) {
+                    self.preview_open = false;
                     self.focus = FocusPane::Chat;
                     self.vim_mode = VimMode::Insert;
                     return;
@@ -1541,9 +1606,10 @@ impl TuiClient {
                     return;
                 }
 
-                // 5. Left Sidebar: Recent Chats (click row to load)
+                // 5. Left Sidebar: Recent Chats (click away from preview dismisses preview & loads chat)
                 if let Some(lr) = self.last_left_rect {
                     if in_rect(lr) && !(self.preview_open && self.snap.preview_side == "left") {
+                        self.preview_open = false;
                         self.focus = FocusPane::History;
                         self.vim_mode = VimMode::Normal;
                         if me.row > lr.y && me.row + 1 < lr.y + lr.height {
@@ -1576,12 +1642,14 @@ impl TuiClient {
                 }
                 if let Some(tr_tips) = self.last_tips_rect {
                     if in_rect(tr_tips) {
+                        self.preview_open = false;
                         self.trigger_mouse_action(MouseAction::OpenHelp);
                         return;
                     }
                 }
                 if let Some(sr) = self.last_specs_rect {
                     if in_rect(sr) {
+                        self.preview_open = false;
                         self.open_provider_modal();
                     }
                 }
@@ -1671,6 +1739,9 @@ impl TuiClient {
                         self.local_notice = Some(format!(
                             "Previewing on right: {title} (press p or Ctrl+E for Models)"
                         ));
+                    } else {
+                        // Clicked on non-artifact row (e.g. user message or blank) -> dismiss preview
+                        self.preview_open = false;
                     }
                 }
             }
@@ -2500,7 +2571,45 @@ impl TuiClient {
         }
     }
 
+    fn open_preview_full_modal(&mut self) {
+        let Some(art) = self.preview_artifacts.get(self.preview_idx).cloned() else {
+            return;
+        };
+        let lines = render_markdown_lines(&art.content, None, 100);
+        self.modal = Modal::PreviewFull {
+            title: art.title,
+            content: art.content,
+            lines,
+            scroll: 0,
+        };
+    }
+
     fn handle_modal_key(&mut self, code: KeyCode) {
+        if let Modal::PreviewFull {
+            content,
+            lines,
+            scroll,
+            ..
+        } = &mut self.modal
+        {
+            let max_s = (lines.len() as u16).saturating_sub(10);
+            match code {
+                KeyCode::Esc | KeyCode::Char('q') => self.modal = Modal::None,
+                KeyCode::Char('y') => {
+                    let txt = content.clone();
+                    self.copy_text_to_clipboard(&txt, "Copied full preview to clipboard");
+                }
+                KeyCode::Up | KeyCode::Char('k') => *scroll = scroll.saturating_sub(2),
+                KeyCode::Down | KeyCode::Char('j') => *scroll = (*scroll + 2).min(max_s),
+                KeyCode::PageUp => *scroll = scroll.saturating_sub(15),
+                KeyCode::PageDown => *scroll = (*scroll + 15).min(max_s),
+                KeyCode::Home | KeyCode::Char('g') => *scroll = 0,
+                KeyCode::End | KeyCode::Char('G') => *scroll = max_s,
+                _ => {}
+            }
+            return;
+        }
+
         if let Modal::MarkdownViewer { lines, scroll, .. } = &mut self.modal {
             let max_s = (lines.len() as u16).saturating_sub(10);
             match code {
@@ -2870,6 +2979,7 @@ impl TuiClient {
             | Modal::Help { .. }
             | Modal::MarkdownPicker { .. }
             | Modal::MarkdownViewer { .. }
+            | Modal::PreviewFull { .. }
             | Modal::CopyPicker { .. }
             | Modal::CopyLines { .. } => {}
         }
@@ -2880,6 +2990,7 @@ impl TuiClient {
             Modal::None
             | Modal::Help { .. }
             | Modal::MarkdownViewer { .. }
+            | Modal::PreviewFull { .. }
             | Modal::CopyLines { .. } => 0,
             Modal::Provider(_) => self.snap.providers.len(),
             Modal::Model(_) => self.snap.models.len(),
@@ -2894,6 +3005,7 @@ impl TuiClient {
             Modal::None
             | Modal::Help { .. }
             | Modal::MarkdownViewer { .. }
+            | Modal::PreviewFull { .. }
             | Modal::CopyLines { .. } => None,
             Modal::Provider(s)
             | Modal::Model(s)
@@ -2981,15 +3093,59 @@ impl TuiClient {
         } else {
             Color::Rgb(75, 130, 100)
         };
-        let inner_w = area.width.saturating_sub(4).max(20) as usize;
-        let (title, body_lines): (String, Vec<Line<'static>>) =
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(2), Constraint::Min(3)])
+            .split(area);
+
+        // Top Preview Bar with [Copy (y)] and [Full] (clicking bar opens full modal!)
+        let copy_lbl = " [Copy (y)] ";
+        let full_lbl = " [Full] ";
+        let hint_lbl = " p/Ctrl+E:Models  x:Close";
+        let cx0 = chunks[0].x + 1;
+        let cx1 = cx0 + copy_lbl.chars().count() as u16;
+        self.last_preview_bar_rect = Some(chunks[0]);
+        self.preview_copy_x_range = Some((cx0, cx1));
+
+        let bar = Paragraph::new(Line::from(vec![
+            Span::styled(
+                copy_lbl,
+                Style::default()
+                    .bg(Color::Rgb(28, 95, 65))
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                full_lbl,
+                Style::default()
+                    .bg(Color::Rgb(35, 80, 135))
+                    .fg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(hint_lbl, Style::default().fg(Color::DarkGray)),
+        ]))
+        .block(
+            Block::default()
+                .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(border_color))
+                .title(Span::styled(
+                    format!(
+                        " Preview [{}/{}] ",
+                        self.preview_idx + 1,
+                        self.preview_artifacts.len().max(1)
+                    ),
+                    Style::default()
+                        .fg(Color::LightGreen)
+                        .add_modifier(Modifier::BOLD),
+                )),
+        );
+        frame.render_widget(bar, chunks[0]);
+
+        let inner_w = chunks[1].width.saturating_sub(4).max(20) as usize;
+        let body_lines: Vec<Line<'static>> =
             if let Some(art) = self.preview_artifacts.get(self.preview_idx) {
-                let t = format!(
-                    " Preview [{}/{}] {} | p/Ctrl+E: Models | x:Close ",
-                    self.preview_idx + 1,
-                    self.preview_artifacts.len().max(1),
-                    art.title
-                );
                 let mut out = Vec::new();
                 match art.kind.as_str() {
                     "markdown" => out.extend(render_markdown_lines(&art.content, None, inner_w)),
@@ -3002,15 +3158,12 @@ impl TuiClient {
                         out.extend(render_markdown_lines(&fenced, None, inner_w));
                     }
                 }
-                (t, out)
+                out
             } else {
-                (
-                    " Preview (Empty) ".to_string(),
-                    vec![Line::from(Span::styled(
-                        "No artifact generated yet.",
-                        Style::default().fg(Color::DarkGray),
-                    ))],
-                )
+                vec![Line::from(Span::styled(
+                    "No artifact generated yet.",
+                    Style::default().fg(Color::DarkGray),
+                ))]
             };
 
         let p = Paragraph::new(body_lines)
@@ -3020,15 +3173,9 @@ impl TuiClient {
                 Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(border_color))
-                    .title(Span::styled(
-                        title,
-                        Style::default()
-                            .fg(Color::LightGreen)
-                            .add_modifier(Modifier::BOLD),
-                    )),
+                    .border_style(Style::default().fg(border_color)),
             );
-        frame.render_widget(p, area);
+        frame.render_widget(p, chunks[1]);
     }
 
     fn render_inspector_panel(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect) {
@@ -3105,68 +3252,73 @@ impl TuiClient {
                     )),
             );
         self.last_specs_rect = Some(sections[0]);
-        self.last_models_rect = Some(sections[1]);
         self.last_tips_rect = Some(sections[2]);
         frame.render_widget(specs_box, sections[0]);
 
-        let model_items: Vec<ListItem<'_>> = if self.snap.models.is_empty() {
-            vec![ListItem::new(Span::styled(
-                "Press r to fetch models",
-                Style::default().fg(Color::DarkGray),
-            ))]
+        if self.preview_open {
+            self.last_models_rect = None;
+            self.render_preview_panel(frame, sections[1]);
         } else {
-            self.snap
-                .models
-                .iter()
-                .map(|m| {
-                    let active = m == &self.snap.model;
-                    let prefix = if active { "★ " } else { "  " };
-                    ListItem::new(Line::from(vec![
-                        Span::styled(prefix, Style::default().fg(Color::LightYellow)),
-                        Span::styled(
-                            m.clone(),
-                            if active {
-                                Style::default()
-                                    .fg(Color::LightYellow)
-                                    .add_modifier(Modifier::BOLD)
-                            } else {
-                                Style::default().fg(Color::White)
-                            },
-                        ),
-                    ]))
-                })
-                .collect()
-        };
-        let switcher_title = if focused {
-            " Switch Model (j/k Enter | p/Ctrl+E: Preview) "
-        } else {
-            " Models (p/Ctrl+E: Preview | Ctrl+W l) "
-        };
-        let model_list = List::new(model_items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(border_color))
-                    .title(Span::styled(
-                        switcher_title,
-                        Style::default()
-                            .fg(if focused {
-                                Color::LightYellow
-                            } else {
-                                Color::Gray
-                            })
-                            .add_modifier(Modifier::BOLD),
-                    )),
-            )
-            .highlight_style(
-                Style::default()
-                    .bg(Color::Rgb(85, 65, 25))
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .highlight_symbol("▶ ");
-        frame.render_stateful_widget(model_list, sections[1], &mut self.inspector_model_state);
+            self.last_models_rect = Some(sections[1]);
+            let model_items: Vec<ListItem<'_>> = if self.snap.models.is_empty() {
+                vec![ListItem::new(Span::styled(
+                    "Press r to fetch models",
+                    Style::default().fg(Color::DarkGray),
+                ))]
+            } else {
+                self.snap
+                    .models
+                    .iter()
+                    .map(|m| {
+                        let active = m == &self.snap.model;
+                        let prefix = if active { "★ " } else { "  " };
+                        ListItem::new(Line::from(vec![
+                            Span::styled(prefix, Style::default().fg(Color::LightYellow)),
+                            Span::styled(
+                                m.clone(),
+                                if active {
+                                    Style::default()
+                                        .fg(Color::LightYellow)
+                                        .add_modifier(Modifier::BOLD)
+                                } else {
+                                    Style::default().fg(Color::White)
+                                },
+                            ),
+                        ]))
+                    })
+                    .collect()
+            };
+            let switcher_title = if focused {
+                " Switch Model (j/k Enter | p/Ctrl+E: Preview) "
+            } else {
+                " Models (p/Ctrl+E: Preview | Ctrl+W l) "
+            };
+            let model_list = List::new(model_items)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(border_color))
+                        .title(Span::styled(
+                            switcher_title,
+                            Style::default()
+                                .fg(if focused {
+                                    Color::LightYellow
+                                } else {
+                                    Color::Gray
+                                })
+                                .add_modifier(Modifier::BOLD),
+                        )),
+                )
+                .highlight_style(
+                    Style::default()
+                        .bg(Color::Rgb(85, 65, 25))
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .highlight_symbol("▶ ");
+            frame.render_stateful_widget(model_list, sections[1], &mut self.inspector_model_state);
+        }
 
         // Lower-third: Recommended TUI Tips & Help Launcher
         let kb = &self.snap.keybinds;
@@ -3264,9 +3416,12 @@ impl TuiClient {
         self.last_models_rect = None;
         self.last_tips_rect = None;
         self.last_modal_rect = None;
+        self.last_preview_bar_rect = None;
+        self.preview_copy_x_range = None;
         self.header_hitboxes.clear();
         self.footer_hitboxes.clear();
         self.help_tab_hitboxes.clear();
+        self.copy_button_hitboxes.clear();
 
         if let Some(la) = left_area {
             if self.preview_open && self.snap.preview_side == "left" {
@@ -3276,10 +3431,11 @@ impl TuiClient {
             }
         }
         if let Some(ra) = right_area {
-            if self.preview_open && self.snap.preview_side != "left" {
-                self.render_preview_panel(frame, ra);
-            } else if wide_mode {
+            if wide_mode {
+                // Keep Model Specs (top) & Tips (bottom) always visible; only swap middle slot!
                 self.render_inspector_panel(frame, ra);
+            } else if self.preview_open {
+                self.render_preview_panel(frame, ra);
             }
         }
 
@@ -3451,19 +3607,44 @@ impl TuiClient {
                     &self.snap.model,
                     false,
                     inner_width,
+                    m.stats.as_ref(),
                 );
                 let added = lines.len() - start;
                 if m.role == "assistant" {
                     let msg_slice = std::slice::from_ref(m);
                     let arts = extract_artifacts(msg_slice);
                     let fallback = arts.first().cloned();
+                    // Record [Copy] hitbox on assistant header row
+                    if let Some(hdr) = lines.get(start) {
+                        let plain: String = hdr.spans.iter().map(|s| s.content.as_ref()).collect();
+                        if let Some(pos) = plain.find("[Copy]") {
+                            let x0 = plain[..pos].chars().count() as u16;
+                            self.copy_button_hitboxes
+                                .push((start, x0, x0 + 6, m.content.clone()));
+                        }
+                    }
                     // Map code-bordered rows to matching fenced artifacts when present, else message Markdown
                     let mut code_idx = 0usize;
                     let mut in_code_box = false;
-                    for line in &lines[start..] {
+                    for (rel_i, line) in lines[start..].iter_mut().enumerate() {
                         let plain: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
                         if plain.contains("┌─") {
                             in_code_box = true;
+                            if let Some(art) = arts.get(code_idx) {
+                                let prefix_w = plain.chars().count() as u16;
+                                line.spans.push(Span::styled(
+                                    " [Copy]",
+                                    Style::default()
+                                        .fg(Color::LightGreen)
+                                        .add_modifier(Modifier::BOLD),
+                                ));
+                                self.copy_button_hitboxes.push((
+                                    start + rel_i,
+                                    prefix_w,
+                                    prefix_w + 7,
+                                    art.content.clone(),
+                                ));
+                            }
                         }
                         let art = if in_code_box {
                             arts.get(code_idx).cloned().or_else(|| fallback.clone())
@@ -3494,6 +3675,7 @@ impl TuiClient {
                     &self.snap.model,
                     true,
                     inner_width,
+                    None,
                 );
                 let added = lines.len() - start;
                 self.transcript_row_artifacts.extend(std::iter::repeat_n(None, added));
@@ -4035,6 +4217,42 @@ impl TuiClient {
                     .highlight_symbol("▶ ");
                 frame.render_stateful_widget(list, parts[1], list_state);
             }
+            Modal::PreviewFull {
+                title,
+                lines,
+                scroll,
+                ..
+            } => {
+                let area = centered_rect(90, 88, frame.area());
+                self.last_modal_rect = Some(area);
+                frame.render_widget(Clear, area);
+                let parts = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(8), Constraint::Length(1)])
+                    .split(area);
+                let viewer = Paragraph::new(lines.clone())
+                    .wrap(Wrap { trim: false })
+                    .scroll((*scroll, 0))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .border_style(Style::default().fg(Color::LightGreen))
+                            .title(Span::styled(
+                                format!(" {title} — Complete Preview (y: Copy All | j/k: Scroll | Esc: Close) "),
+                                Style::default()
+                                    .fg(Color::LightGreen)
+                                    .add_modifier(Modifier::BOLD),
+                            )),
+                    );
+                frame.render_widget(viewer, parts[0]);
+                let pfoot = Paragraph::new(Line::from(vec![
+                    key_chip("y", "Copy All"),
+                    key_chip("j/k", "Scroll"),
+                    key_chip("Esc/q", "Close"),
+                ]));
+                frame.render_widget(pfoot, parts[1]);
+            }
             Modal::MarkdownViewer {
                 title,
                 lines,
@@ -4332,6 +4550,7 @@ fn render_styled_message(
     model_name: &str,
     is_streaming: bool,
     max_width: usize,
+    stats: Option<&ResponseStats>,
 ) {
     if role == "user" {
         out.push(Line::from(Span::styled(
@@ -4363,12 +4582,21 @@ fn render_styled_message(
     } else {
         format!(" ╭─ ✦ HyprPilot ({model_name}) ")
     };
-    out.push(Line::from(Span::styled(
+    let mut header_spans = vec![Span::styled(
         badge,
         Style::default()
             .fg(Color::LightMagenta)
             .add_modifier(Modifier::BOLD),
-    )));
+    )];
+    if !is_streaming {
+        header_spans.push(Span::styled(
+            "[Copy]",
+            Style::default()
+                .fg(Color::LightGreen)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    out.push(Line::from(header_spans));
 
     let bar = Span::styled(" │ ", Style::default().fg(Color::Magenta));
     let md_lines = render_markdown_lines(content, Some(bar), max_width.saturating_sub(4).max(30));
@@ -4376,10 +4604,20 @@ fn render_styled_message(
         out.extend(wrap_styled_line_preserving_prefix(line, 1, max_width));
     }
 
-    out.push(Line::from(Span::styled(
+    let mut footer_spans = vec![Span::styled(
         " ╰──",
         Style::default().fg(Color::Magenta),
-    )));
+    )];
+    if let Some(st) = stats {
+        let summary = st.format_compact();
+        if !summary.is_empty() {
+            footer_spans.push(Span::styled(
+                format!(" {summary}"),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+    }
+    out.push(Line::from(footer_spans));
     out.push(Line::from(""));
 }
 
@@ -4467,6 +4705,7 @@ fn run_oneshot(prompt: String) -> Result<()> {
                     let _ = write!(stdout, "{chunk}");
                     let _ = stdout.flush();
                 }
+                StreamEvent::Stats(_) => {}
                 StreamEvent::Done => break,
                 StreamEvent::Error(e) => {
                     eprintln!("\n[Error: {e}]");
@@ -4765,6 +5004,7 @@ mod tests {
             "gemini-2.5-flash-lite",
             false,
             90,
+            None,
         );
         assert!(lines.len() >= 6);
     }
@@ -4788,6 +5028,7 @@ mod tests {
         let msgs = vec![WireMessage {
             role: "assistant".into(),
             content: "Here is your doc:\n```markdown\n# Plan\n- Step 1\n```\n".into(),
+            stats: None,
         }];
         assert!(has_rich_md_artifact(&msgs));
         let arts = extract_artifacts(&msgs);
@@ -4811,6 +5052,7 @@ mod tests {
             "gemini",
             false,
             40,
+            None,
         );
         // Middle lines (skip header, footer, trailing blank) must all start with " │ " in Cyan
         let body_lines = &lines[1..lines.len() - 2];

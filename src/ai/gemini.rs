@@ -3,7 +3,7 @@ use reqwest::header::{HeaderName, HeaderValue};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
-use super::{AiMessage, StreamEvent, build_common_headers, consume_sse_stream};
+use super::{AiMessage, ResponseStats, StreamEvent, build_common_headers, consume_sse_stream_with_stats};
 use crate::storage::config::{AuthMode, ProviderProfile};
 
 pub async fn stream(
@@ -12,7 +12,7 @@ pub async fn stream(
     system_prompt: Option<&str>,
     messages: &[AiMessage],
     tx: &mpsc::UnboundedSender<StreamEvent>,
-) -> Result<()> {
+) -> Result<ResponseStats> {
     let token = provider.token.trim();
     if token.is_empty() && provider.auth_mode != AuthMode::None {
         anyhow::bail!(
@@ -68,10 +68,10 @@ pub async fn stream(
         .await
         .with_context(|| format!("request to {url} failed"))?;
 
-    consume_sse_stream(resp, tx, extract_gemini_delta).await
+    consume_sse_stream_with_stats(resp, tx, extract_gemini_chunk).await
 }
 
-pub fn extract_gemini_delta(payload: &str) -> Result<Option<String>> {
+pub fn extract_gemini_chunk(payload: &str) -> Result<(Option<String>, Option<ResponseStats>)> {
     let val: Value = serde_json::from_str(payload)
         .with_context(|| format!("invalid Gemini SSE JSON: {payload}"))?;
     if let Some(err) = val.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()) {
@@ -80,7 +80,24 @@ pub fn extract_gemini_delta(payload: &str) -> Result<Option<String>> {
     let text = val["candidates"][0]["content"]["parts"][0]["text"]
         .as_str()
         .map(|s| s.to_string());
-    Ok(text)
+    let finish = val["candidates"][0]["finishReason"].as_str().map(|s| s.to_string());
+    let um = val.get("usageMetadata");
+    let stats = if um.is_some() || finish.is_some() {
+        Some(ResponseStats {
+            input_tokens: um.and_then(|u| u.get("promptTokenCount")).and_then(|v| v.as_u64()),
+            output_tokens: um.and_then(|u| u.get("candidatesTokenCount")).and_then(|v| v.as_u64()),
+            total_tokens: um.and_then(|u| u.get("totalTokenCount")).and_then(|v| v.as_u64()),
+            duration_ms: 0,
+            finish_reason: finish,
+        })
+    } else {
+        None
+    };
+    Ok((text, stats))
+}
+
+pub fn extract_gemini_delta(payload: &str) -> Result<Option<String>> {
+    Ok(extract_gemini_chunk(payload)?.0)
 }
 
 #[cfg(test)]

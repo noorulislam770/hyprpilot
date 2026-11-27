@@ -886,6 +886,7 @@ impl NativeChatPane {
                                 live_label.set_text(&full);
                                 pane.scroll_to_bottom();
                             }
+                            Some(StreamEvent::Stats(_)) => {}
                             Some(StreamEvent::Done) | None => break,
                             Some(StreamEvent::Error(e)) => {
                                 err_msg = Some(e);

@@ -109,6 +109,7 @@ async fn openai_models_discovery_and_sse_streaming_end_to_end() {
     while let Some(ev) = rx.recv().await {
         match ev {
             StreamEvent::Delta(d) => collected.push_str(&d),
+            StreamEvent::Stats(_) => {}
             StreamEvent::Done => {
                 saw_done = true;
                 break;
@@ -173,6 +174,7 @@ async fn gemini_and_anthropic_sse_streaming_end_to_end() {
     while let Some(ev) = rx.recv().await {
         match ev {
             StreamEvent::Delta(d) => gem_out.push_str(&d),
+            StreamEvent::Stats(_) => {}
             StreamEvent::Done => break,
             StreamEvent::Error(e) => panic!("gemini stream error: {e}"),
         }
@@ -207,6 +209,7 @@ async fn gemini_and_anthropic_sse_streaming_end_to_end() {
     while let Some(ev) = rx2.recv().await {
         match ev {
             StreamEvent::Delta(d) => claude_out.push_str(&d),
+            StreamEvent::Stats(_) => {}
             StreamEvent::Done => break,
             StreamEvent::Error(e) => panic!("anthropic stream error: {e}"),
         }
