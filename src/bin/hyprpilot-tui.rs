@@ -870,6 +870,7 @@ enum MouseAction {
     OpenModel,
     ToggleLinux,
     TogglePreview,
+    ToggleZen,
     SwapSide,
     OpenHistory,
     OpenCopy,
@@ -1280,6 +1281,7 @@ impl TuiClient {
             MouseAction::OpenModel => self.open_model_modal(),
             MouseAction::ToggleLinux => self.send_cmd(&ClientCmd::ToggleLinuxQuick),
             MouseAction::TogglePreview => self.toggle_artifact_preview(),
+            MouseAction::ToggleZen => self.send_cmd(&ClientCmd::ToggleZenMode),
             MouseAction::SwapSide => {
                 let next_side = if self.snap.preview_side == "left" {
                     "right"
@@ -1771,6 +1773,7 @@ impl TuiClient {
                 KeyCode::Char('p') => self.open_provider_modal(),
                 KeyCode::Char('m') => self.open_model_modal(),
                 KeyCode::Char('h') => self.open_history_modal(),
+                KeyCode::Char('z') => self.send_cmd(&ClientCmd::ToggleZenMode),
                 KeyCode::Backspace => self.delete_prev_word(),
                 _ => {}
             }
@@ -1830,6 +1833,7 @@ impl TuiClient {
                     FocusPane::History => FocusPane::Chat,
                 };
             }
+            KeyCode::F(7) => self.send_cmd(&ClientCmd::ToggleZenMode),
             KeyCode::Tab => {
                 self.vim_mode = VimMode::Normal;
                 self.focus = match self.focus {
@@ -3503,6 +3507,7 @@ impl TuiClient {
                 ("/", "Search", MouseAction::EnterSearch),
                 (":", "Cmd", MouseAction::EnterCommand),
                 ("p", "Preview", MouseAction::TogglePreview),
+                ("Alt+Z", "Zen", MouseAction::ToggleZen),
                 ("s", "Side", MouseAction::SwapSide),
                 ("y", "Copy", MouseAction::OpenCopy),
                 ("Ctrl+W", "Pane", MouseAction::CycleFocus),
@@ -3514,6 +3519,7 @@ impl TuiClient {
                 ("Ctrl+P", "Provider", MouseAction::OpenProvider),
                 ("Ctrl+M", "Model", MouseAction::OpenModel),
                 ("Ctrl+E", "Preview", MouseAction::TogglePreview),
+                ("Alt+Z", "Zen", MouseAction::ToggleZen),
                 ("Ctrl+G", "History", MouseAction::OpenHistory),
                 ("Ctrl+Y", "Copy", MouseAction::OpenCopy),
                 ("?", "Help", MouseAction::OpenHelp),

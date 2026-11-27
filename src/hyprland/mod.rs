@@ -290,12 +290,48 @@ pub fn restore_geometry_when_mapped() {
     restore_geometry_for(APP_ID, Some(APP_NAME), "window.json");
 }
 
+fn fetch_active_workspace_id() -> Option<i64> {
+    let raw = run_hyprctl(&["-j", "activeworkspace"]).ok()?;
+    let val: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    val.get("id").and_then(|v| v.as_i64())
+}
+
+fn dispatch_move_to_workspace(address: &str, ws_id: i64) {
+    if is_lua_config() {
+        let cmd = format!(
+            "hl.dsp.window.move({{ workspace = {ws_id}, window = \"address:{address}\" }})"
+        );
+        if run_hyprctl(&["dispatch", &cmd]).is_ok() {
+            return;
+        }
+    }
+    let arg = format!("{ws_id},address:{address}");
+    let _ = run_hyprctl(&["dispatch", "movetoworkspacesilent", &arg]);
+}
+
 fn restore_geometry_for(class_id: &str, preferred_title: Option<&str>, geom_file: &str) {
     let saved = load_geometry_file(geom_file);
+    let active_ws = fetch_active_workspace_id();
     for _ in 0..80 {
         if let Ok(Some(client)) = find_client_by_class(class_id, preferred_title) {
+            if let Some(ws_id) = active_ws {
+                if client.workspace.id != ws_id {
+                    dispatch_move_to_workspace(&client.address, ws_id);
+                }
+            }
             if let Some(ref geom) = saved {
                 apply_geometry_to_address(&client.address, geom);
+            } else {
+                let fallback = SavedGeometry {
+                    x: 0,
+                    y: 0,
+                    width: 960,
+                    height: 540,
+                    fullscreen: false,
+                    font_size: None,
+                    cell_height_px: None,
+                };
+                apply_geometry_to_address(&client.address, &fallback);
             }
             dispatch_focus_address(&client.address);
             if saved.as_ref().is_some_and(|g| g.fullscreen) && client.fullscreen == 0 {

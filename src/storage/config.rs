@@ -322,6 +322,9 @@ impl TuiConfig {
             .with_context(|| format!("failed to read {}", path.display()))?;
         let cfg: TuiConfig = toml::from_str(&raw)
             .with_context(|| format!("failed to parse {}", path.display()))?;
+        if !raw.contains("zen_mode") || !raw.contains("start_mode") || !raw.contains("show_tips") {
+            let _ = cfg.save();
+        }
         Ok(cfg)
     }
 
