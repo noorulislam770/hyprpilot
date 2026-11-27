@@ -883,6 +883,13 @@ enum MouseAction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResizeDivider {
+    LeftCenter,
+    CenterRight,
+    PreviewSplit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FocusPane {
     Chat,
     History,
@@ -1098,6 +1105,10 @@ struct TuiClient {
     header_hitboxes: Vec<(u16, u16, MouseAction)>,
     footer_hitboxes: Vec<(u16, u16, MouseAction)>,
     help_tab_hitboxes: Vec<(u16, u16, u16, usize)>,
+    resizing_divider: Option<ResizeDivider>,
+    last_full_area: Rect,
+    preview_split_pct: u16,
+    live_pane_ratios: Option<[u16; 3]>,
 }
 
 impl TuiClient {
@@ -1173,6 +1184,10 @@ impl TuiClient {
             header_hitboxes: Vec::new(),
             footer_hitboxes: Vec::new(),
             help_tab_hitboxes: Vec::new(),
+            resizing_divider: None,
+            last_full_area: Rect::default(),
+            preview_split_pct: 46,
+            live_pane_ratios: None,
         };
         client.send_cmd(&ClientCmd::GetState);
         Ok(client)
@@ -1443,6 +1458,49 @@ impl TuiClient {
                 self.drag_anchor = None;
                 self.drag_cursor = None;
                 self.dragging = false;
+                self.resizing_divider = None;
+
+                // 0. Pane divider drag-resize check (within ±1 column of pane boundaries)
+                if let (Some(lr), Some(rr)) = (self.last_left_rect, self.last_right_rect) {
+                    let b_left = lr.x + lr.width;
+                    let b_right = rr.x;
+                    if me.column.abs_diff(b_left) <= 1 {
+                        self.resizing_divider = Some(ResizeDivider::LeftCenter);
+                        self.live_pane_ratios = Some(self.snap.pane_ratios);
+                        self.local_notice = Some("Resizing Left/Center pane...".into());
+                        return;
+                    }
+                    if me.column.abs_diff(b_right) <= 1 {
+                        self.resizing_divider = Some(ResizeDivider::CenterRight);
+                        self.live_pane_ratios = Some(self.snap.pane_ratios);
+                        self.local_notice = Some("Resizing Center/Right pane...".into());
+                        return;
+                    }
+                } else if self.preview_open {
+                    if let Some(rr) = self.last_right_rect {
+                        if me.column.abs_diff(rr.x) <= 1 {
+                            self.resizing_divider = Some(ResizeDivider::PreviewSplit);
+                            self.local_notice = Some("Resizing Preview width...".into());
+                            return;
+                        }
+                    } else if let Some(lr) = self.last_left_rect {
+                        if me.column.abs_diff(lr.x + lr.width) <= 1 {
+                            self.resizing_divider = Some(ResizeDivider::PreviewSplit);
+                            self.local_notice = Some("Resizing Preview width...".into());
+                            return;
+                        }
+                    }
+                }
+
+                // 0b. Clicking top border of Preview pane toggles back to Model View
+                if self.preview_open {
+                    if let Some(rr) = self.last_right_rect {
+                        if me.row == rr.y && me.column >= rr.x && me.column < rr.x + rr.width {
+                            self.preview_open = false;
+                            return;
+                        }
+                    }
+                }
 
                 // 1. Center Transcript: start pane-clamped drag selection
                 if in_rect(tr) {
@@ -1528,6 +1586,49 @@ impl TuiClient {
                     }
                 }
             }
+            MouseEventKind::Drag(MouseButton::Left) if self.resizing_divider.is_some() => {
+                let fa = self.last_full_area;
+                let rel_x = me.column.saturating_sub(fa.x) as u32;
+                let total_w = (fa.width as u32).max(1);
+                let pct = ((rel_x * 100) / total_w) as u16;
+                match self.resizing_divider {
+                    Some(ResizeDivider::LeftCenter) => {
+                        let cur = self.live_pane_ratios.unwrap_or(self.snap.pane_ratios);
+                        let r_right = cur[2].clamp(12, 45);
+                        let max_left = 100u16.saturating_sub(r_right + 25);
+                        let new_left = pct.clamp(12, max_left.max(12));
+                        let new_center = 100u16.saturating_sub(new_left + r_right);
+                        self.live_pane_ratios = Some([new_left, new_center, r_right]);
+                    }
+                    Some(ResizeDivider::CenterRight) => {
+                        let cur = self.live_pane_ratios.unwrap_or(self.snap.pane_ratios);
+                        let r_left = cur[0].clamp(12, 45);
+                        let min_split = r_left + 25;
+                        let split_pct = pct.clamp(min_split.min(88), 88);
+                        let new_right = 100u16.saturating_sub(split_pct).max(12);
+                        let new_center = 100u16.saturating_sub(r_left + new_right);
+                        self.live_pane_ratios = Some([r_left, new_center, new_right]);
+                    }
+                    Some(ResizeDivider::PreviewSplit) => {
+                        if self.snap.preview_side == "left" {
+                            self.preview_split_pct = pct.clamp(20, 70);
+                        } else {
+                            self.preview_split_pct = 100u16.saturating_sub(pct).clamp(20, 70);
+                        }
+                    }
+                    None => {}
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.resizing_divider.is_some() => {
+                self.resizing_divider = None;
+                if let Some(ratios) = self.live_pane_ratios.take() {
+                    self.snap.pane_ratios = ratios;
+                    self.send_cmd(&ClientCmd::SetPaneRatios { ratios });
+                } else {
+                    self.local_notice =
+                        Some(format!("Preview width: {}%", self.preview_split_pct));
+                }
+            }
             MouseEventKind::Drag(MouseButton::Left) if self.dragging => {
                 self.drag_cursor = Some(clamp_to_transcript(me.column, me.row));
             }
@@ -1547,7 +1648,13 @@ impl TuiClient {
                     } else if let Some(Some(art)) =
                         self.transcript_row_artifacts.get(a.0).cloned()
                     {
-                        // Single-click on an assistant Markdown/artifact section opens it in the right sidebar preview!
+                        // Single-click on an assistant Markdown/artifact section opens it on the RIGHT sidebar!
+                        if self.snap.preview_side != "right" {
+                            self.snap.preview_side = "right".into();
+                            self.send_cmd(&ClientCmd::SetPreviewSide {
+                                side: "right".into(),
+                            });
+                        }
                         let title = art.title.clone();
                         if let Some(pos) = self
                             .preview_artifacts
@@ -1561,7 +1668,9 @@ impl TuiClient {
                         }
                         self.preview_open = true;
                         self.preview_scroll = 0;
-                        self.local_notice = Some(format!("Previewing: {title}"));
+                        self.local_notice = Some(format!(
+                            "Previewing on right: {title} (press p or Ctrl+E for Models)"
+                        ));
                     }
                 }
             }
@@ -2876,7 +2985,7 @@ impl TuiClient {
         let (title, body_lines): (String, Vec<Line<'static>>) =
             if let Some(art) = self.preview_artifacts.get(self.preview_idx) {
                 let t = format!(
-                    " Preview [{}/{}] {} (s:Side x:Close) ",
+                    " Preview [{}/{}] {} | p/Ctrl+E: Models | x:Close ",
                     self.preview_idx + 1,
                     self.preview_artifacts.len().max(1),
                     art.title
@@ -3029,9 +3138,9 @@ impl TuiClient {
                 .collect()
         };
         let switcher_title = if focused {
-            " Switch Model (j/k Enter | r:Fetch) "
+            " Switch Model (j/k Enter | p/Ctrl+E: Preview) "
         } else {
-            " Models (Ctrl+W l to switch) "
+            " Models (p/Ctrl+E: Preview | Ctrl+W l) "
         };
         let model_list = List::new(model_items)
             .block(
@@ -3106,10 +3215,12 @@ impl TuiClient {
 
     fn render(&mut self, frame: &mut ratatui::Frame<'_>) {
         let full_area = frame.area();
+        self.last_full_area = full_area;
         // Zen Mode (enabled by default) keeps only the chat window unless Preview is open or Zen is toggled off.
         let wide_mode =
             !self.snap.zen_mode && !self.chat_zoomed && self.force_panes.unwrap_or(full_area.width >= 150);
-        let [r_left, r_center, r_right] = self.snap.pane_ratios;
+        let [r_left, r_center, r_right] = self.live_pane_ratios.unwrap_or(self.snap.pane_ratios);
+        let pv_pct = self.preview_split_pct.clamp(20, 70);
 
         let (left_area, center_area, right_area): (Option<Rect>, Rect, Option<Rect>) = if self.chat_zoomed {
             (None, full_area, None)
@@ -3127,13 +3238,19 @@ impl TuiClient {
             if self.snap.preview_side == "left" {
                 let cols = Layout::default()
                     .direction(Direction::Horizontal)
-                    .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
+                    .constraints([
+                        Constraint::Percentage(pv_pct),
+                        Constraint::Percentage(100 - pv_pct),
+                    ])
                     .split(full_area);
                 (Some(cols[0]), cols[1], None)
             } else {
                 let cols = Layout::default()
                     .direction(Direction::Horizontal)
-                    .constraints([Constraint::Percentage(54), Constraint::Percentage(46)])
+                    .constraints([
+                        Constraint::Percentage(100 - pv_pct),
+                        Constraint::Percentage(pv_pct),
+                    ])
                     .split(full_area);
                 (None, cols[0], Some(cols[1]))
             }
